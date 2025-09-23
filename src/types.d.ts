@@ -1,4 +1,3 @@
-// src/types.d.ts
 declare module 'api' {
   const joplin: any;
   export default joplin;

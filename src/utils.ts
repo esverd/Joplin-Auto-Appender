@@ -1,4 +1,3 @@
-// src/utils.ts
 export type SelectionRange = { from: number; to: number };
 export type SelectionContext = {
   text: string;

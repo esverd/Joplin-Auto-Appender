@@ -1,4 +1,3 @@
-// package.json
 {
   "name": "joplin-plugin-move-selection-to-completed",
   "version": "0.1.0",
