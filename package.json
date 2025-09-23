@@ -1,0 +1,16 @@
+// package.json
+{
+  "name": "joplin-plugin-move-selection-to-completed",
+  "version": "0.1.0",
+  "description": "Cut selection and prepend to a Completed note, then restore focus.",
+  "author": "Sverd Industries",
+  "license": "MIT",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --outfile=dist/index.js --platform=node --external:api && esbuild src/cm-bridge.ts --bundle --outfile=dist/cm-bridge.js --platform=browser",
+    "watch": "npm run build -- --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5",
+    "typescript": "^5.5.4"
+  }
+}
