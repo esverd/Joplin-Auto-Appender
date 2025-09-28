@@ -8,6 +8,7 @@ import {
 const joplin: any = (globalThis as any).joplin;
 const ContentScriptType = { CodeMirrorPlugin: 1 } as const;
 const MenuItemLocation = { Tools: 1 } as const;
+const SettingItemType = { Int: 1, String: 2, Bool: 3, Array: 4, Object: 5, Button: 6 } as const;
 
 const SETTINGS = {
   section: 'msc',
@@ -31,7 +32,7 @@ async function registerSettings() {
   await joplin.settings.registerSettings({
     [SETTINGS.targetMode]: {
       value: 'global',
-      type: 2,
+      type: SettingItemType.String,
       public: true,
       label: 'Target mode',
       section: SETTINGS.section,
@@ -39,35 +40,35 @@ async function registerSettings() {
     },
     [SETTINGS.targetNoteId]: {
       value: '',
-      type: 0,
+      type: SettingItemType.String,
       public: true,
       label: 'Global Target Note ID',
       section: SETTINGS.section
     },
     [SETTINGS.completedNoteName]: {
       value: 'Completed Items',
-      type: 0,
+      type: SettingItemType.String,
       public: true,
       label: 'Per-notebook completed note title',
       section: SETTINGS.section
     },
     [SETTINGS.headerEnabled]: {
       value: true,
-      type: 3,
+      type: SettingItemType.Bool,
       public: true,
       label: 'Prepend header',
       section: SETTINGS.section
     },
     [SETTINGS.headerTemplate]: {
       value: '### {{date:YYYY-MM-DD}} — from "{{title}}"',
-      type: 0,
+      type: SettingItemType.String,
       public: true,
       label: 'Header template',
       section: SETTINGS.section
     },
     [SETTINGS.fallback]: {
       value: 'taskBlock',
-      type: 2,
+      type: SettingItemType.String,
       public: true,
       label: 'When no selection',
       section: SETTINGS.section,
@@ -75,14 +76,14 @@ async function registerSettings() {
     },
     [SETTINGS.autoToggleTask]: {
       value: true,
-      type: 3,
+      type: SettingItemType.Bool,
       public: true,
       label: 'Auto toggle “- [ ]” to “- [x]” when moving a single task line',
       section: SETTINGS.section
     },
     [SETTINGS.dateLocale]: {
       value: 'en-US',
-      type: 0,
+      type: SettingItemType.String,
       public: true,
       label: 'Date locale for {{date}}',
       section: SETTINGS.section
