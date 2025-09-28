@@ -38,12 +38,17 @@ function toggleTaskIfSingleLine(block, enabled) {
 
 // src/index.ts
 var joplin = globalThis.joplin;
-var ContentScriptType = { CodeMirrorPlugin: 1 };
+var ContentScriptType = { CodeMirrorPlugin: 1, HtmlPlugin: 3 };
 var MenuItemLocation = {
   Tools: "tools",
   NoteListContextMenu: "noteListContextMenu"
 };
 var SettingItemType = { Int: 1, String: 2, Bool: 3, Array: 4, Object: 5, Button: 6 };
+var BRIDGE_NAME = "msc-editor-bridge";
+var HTML_BRIDGE_NAME = `${BRIDGE_NAME}-html`;
+var pendingBridgeRequests = /* @__PURE__ */ new Map();
+var bridgeListenerRegistered = false;
+var bridgeWindowUnsub = null;
 async function removeMenuItem(id) {
   const remover = joplin.views.menuItems?.remove;
   if (typeof remover !== "function") return;
@@ -214,18 +219,76 @@ async function setNotebookOverride(folderId, noteId) {
   else delete overrides[folderId];
   await joplin.settings.setValue(SETTINGS.perNotebookOverrides, overrides);
 }
+function handleBridgeMessage(raw) {
+  const msg = raw && raw.__MSC_RES__ ? raw.__MSC_RES__ : raw;
+  const id = msg?.requestId;
+  if (!id) {
+    if (msg?.event === "MSC_DEBUG") {
+      const details = JSON.stringify(msg.data ?? msg, null, 2);
+      console.info("[MSC debug]", details);
+    }
+    return;
+  }
+  const pending = pendingBridgeRequests.get(id);
+  if (!pending) return;
+  pendingBridgeRequests.delete(id);
+  clearTimeout(pending.timeout);
+  if (msg.ok) pending.resolve(msg.data);
+  else pending.reject(new Error(msg.error || "Bridge error"));
+}
+async function ensureBridgeListener() {
+  if (bridgeListenerRegistered) return;
+  const cs = joplin.contentScripts;
+  if (typeof cs?.onMessage === "function") {
+    try {
+      await cs.onMessage(BRIDGE_NAME, (raw) => handleBridgeMessage(raw));
+      await cs.onMessage(HTML_BRIDGE_NAME, (raw) => handleBridgeMessage(raw));
+    } catch (err) {
+      console.info("[MSC debug] contentScripts.onMessage unavailable:", err?.message || err);
+    }
+  }
+  if (!bridgeWindowUnsub && joplin.window?.onMessage) {
+    bridgeWindowUnsub = await joplin.window.onMessage((raw) => handleBridgeMessage(raw));
+  }
+  bridgeListenerRegistered = true;
+}
 async function bridgeRequest(type, payload) {
+  await ensureBridgeListener();
   const id = Math.random().toString(36).slice(2);
   return new Promise(async (resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Editor bridge timeout")), 3e3);
-    const unsub = await joplin.window.onMessage((msg) => {
-      if (!msg || !msg.requestId || msg.requestId !== id) return;
+    const timeout = setTimeout(() => {
+      pendingBridgeRequests.delete(id);
+      reject(new Error("Editor bridge timeout"));
+    }, 3e3);
+    pendingBridgeRequests.set(id, { resolve, reject, timeout });
+    let sent = false;
+    const cs = joplin.contentScripts;
+    if (typeof cs?.postMessage === "function") {
+      try {
+        await cs.postMessage(BRIDGE_NAME, { type, requestId: id, payload });
+        sent = true;
+      } catch {
+      }
+      try {
+        await cs.postMessage(HTML_BRIDGE_NAME, { type, requestId: id, payload });
+        sent = true;
+      } catch {
+      }
+    }
+    if (!sent) {
+      if (typeof joplin.window?.postMessage === "function") {
+        try {
+          await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
+          sent = true;
+        } catch {
+        }
+      }
+    }
+    if (!sent) {
       clearTimeout(timeout);
-      unsub();
-      if (msg.ok) resolve(msg.data);
-      else reject(new Error(msg.error || "Bridge error"));
-    });
-    await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
+      pendingBridgeRequests.delete(id);
+      reject(new Error("Unable to communicate with editor bridge (no content script messaging support)"));
+    }
   });
 }
 async function getSelectionContext() {
@@ -383,7 +446,12 @@ joplin.plugins.register({
     const accelerator = (await joplin.settings.value(SETTINGS.commandShortcut))?.trim();
     await joplin.contentScripts.register(
       ContentScriptType.CodeMirrorPlugin,
-      "msc-editor-bridge",
+      BRIDGE_NAME,
+      "./cm-bridge.js"
+    );
+    await joplin.contentScripts.register(
+      ContentScriptType.HtmlPlugin,
+      HTML_BRIDGE_NAME,
       "./cm-bridge.js"
     );
     await joplin.commands.register({
@@ -391,50 +459,65 @@ joplin.plugins.register({
       label: "Move Selection to Completed",
       iconName: "fas fa-arrow-up",
       execute: async () => {
-        const source = await getSelectedNote();
-        if (!source) return;
-        let ctx;
         try {
-          ctx = await getSelectionContext();
-        } catch {
-          await joplin.views.dialogs.showMessageBox("Move Selection: editor bridge unavailable.");
-          return;
-        }
-        let movedText = ctx.text?.trimEnd() ?? "";
-        let ranges = ctx.ranges || [];
-        const cursorIdx = ctx.cursorIndex ?? 0;
-        if (!movedText) {
-          const fb = await joplin.settings.value(SETTINGS.fallback);
-          if (fb === "none") {
-            await joplin.views.dialogs.showMessageBox("Nothing selected.");
+          const source = await getSelectedNote();
+          if (!source) return;
+          let ctx;
+          try {
+            ctx = await getSelectionContext();
+          } catch (err) {
+            const msg = err?.message ? `Move Selection: ${err.message}` : "Move Selection: editor bridge unavailable. Click into the note editor and try again.";
+            await joplin.views.dialogs.showMessageBox(msg);
             return;
           }
-          const fbData = fb === "line" ? await getCurrentLineViaBridge() : await getTaskBlockViaBridge();
-          movedText = (fbData.text || "").trimEnd();
-          ranges = fbData.ranges || [];
+          let movedText = ctx.text?.trimEnd() ?? "";
+          let ranges = ctx.ranges || [];
+          const cursorIdx = ctx.cursorIndex ?? 0;
+          let editorImpl = ctx.impl;
+          if (!movedText) {
+            const fb = await joplin.settings.value(SETTINGS.fallback);
+            if (fb === "none") {
+              await joplin.views.dialogs.showMessageBox("Move Selection: nothing selected.");
+              return;
+            }
+            const fbData = fb === "line" ? await getCurrentLineViaBridge() : await getTaskBlockViaBridge();
+            movedText = (fbData.text || "").trimEnd();
+            ranges = fbData.ranges || [];
+            editorImpl = fbData.impl ?? editorImpl;
+          }
+          if (!movedText || ranges.length === 0) {
+            await joplin.views.dialogs.showMessageBox("Move Selection: nothing to move.");
+            return;
+          }
+          const toggle = await joplin.settings.value(SETTINGS.autoToggleTask);
+          movedText = toggleTaskIfSingleLine(movedText, toggle);
+          const updatedDocText = await cutRangesViaBridge(ranges);
+          if (editorImpl === "tinymce") {
+            try {
+              await joplin.commands.execute("editor.save");
+            } catch {
+            }
+          } else {
+            await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+          }
+          const target = await findOrCreateTargetNote(source);
+          const headerEnabled = await joplin.settings.value(SETTINGS.headerEnabled);
+          const tpl = await joplin.settings.value(SETTINGS.headerTemplate);
+          const locale = await joplin.settings.value(SETTINGS.dateLocale);
+          const folder = await joplin.data.get(["folders", source.parent_id], { fields: ["id", "title"] });
+          const header = headerEnabled ? formatHeader(tpl, {
+            date: /* @__PURE__ */ new Date(),
+            title: source.title || "",
+            notebook: folder?.title || "",
+            locale
+          }) : null;
+          await prependToNote(target, movedText, header);
+          await restoreCursorViaBridge(cursorIdx);
+        } catch (err) {
+          await joplin.views.dialogs.showMessageBox(
+            `Move Selection failed: ${err?.message || String(err)}`
+          );
         }
-        if (!movedText || ranges.length === 0) {
-          await joplin.views.dialogs.showMessageBox("Nothing to move.");
-          return;
-        }
-        const toggle = await joplin.settings.value(SETTINGS.autoToggleTask);
-        movedText = toggleTaskIfSingleLine(movedText, toggle);
-        const updatedDocText = await cutRangesViaBridge(ranges);
-        await safePutNoteBody(source.id, updatedDocText, source.updated_time);
-        const target = await findOrCreateTargetNote(source);
-        const headerEnabled = await joplin.settings.value(SETTINGS.headerEnabled);
-        const tpl = await joplin.settings.value(SETTINGS.headerTemplate);
-        const locale = await joplin.settings.value(SETTINGS.dateLocale);
-        const folder = await joplin.data.get(["folders", source.parent_id], { fields: ["id", "title"] });
-        const header = headerEnabled ? formatHeader(tpl, {
-          date: /* @__PURE__ */ new Date(),
-          title: source.title || "",
-          notebook: folder?.title || "",
-          locale
-        }) : null;
-        await prependToNote(target, movedText, header);
-        await restoreCursorViaBridge(cursorIdx);
-        await joplin.views.dialogs.showMessageBox("Moved to Completed.");
       }
     });
     await joplin.commands.register({
