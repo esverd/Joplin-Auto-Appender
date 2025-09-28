@@ -14,15 +14,19 @@ const SETTINGS = {
   section: 'msc',
   targetMode: 'msc.targetMode',              // 'global' | 'perNotebook'
   targetNoteId: 'msc.targetNoteId',          // for global mode
+  targetNoteLabel: 'msc.targetNoteLabel',
+  globalNotebookPath: 'msc.globalNotebookPath',
   headerEnabled: 'msc.headerEnabled',
   headerTemplate: 'msc.headerTemplate',      // "### {{date:YYYY-MM-DD}} — from \"{{title}}\""
   fallback: 'msc.fallback',                  // 'line' | 'taskBlock' | 'none'
   autoToggleTask: 'msc.autoToggleTask',
   completedNoteName: 'msc.completedNoteName',
-  dateLocale: 'msc.dateLocale'
+  dateLocale: 'msc.dateLocale',
+  commandShortcut: 'msc.commandShortcut'
 };
 
 type Note = { id: string; title: string; body: string; parent_id: string; updated_time?: number };
+type Folder = { id: string; title: string; parent_id: string };
 
 async function registerSettings() {
   await joplin.settings.registerSection(SETTINGS.section, {
@@ -34,22 +38,42 @@ async function registerSettings() {
       value: 'global',
       type: SettingItemType.String,
       public: true,
-      label: 'Target mode',
+      label: 'Destination mode',
+      description: 'Choose whether moved text always goes to one note or to a per-notebook “Completed” note.',
       section: SETTINGS.section,
-      options: { global: 'Global (single note)', perNotebook: 'Per notebook' }
+      options: {
+        global: 'Single destination note (set below)',
+        perNotebook: 'Per notebook “Completed” note'
+      }
+    },
+    [SETTINGS.targetNoteLabel]: {
+      value: '',
+      type: SettingItemType.String,
+      public: true,
+      label: 'Global destination note',
+      description: 'Filled by the “Set Global Destination to Current Note” command. Leave blank to let the plugin create one when needed.',
+      section: SETTINGS.section
     },
     [SETTINGS.targetNoteId]: {
       value: '',
       type: SettingItemType.String,
+      public: false,
+      label: 'Global destination note id'
+    },
+    [SETTINGS.globalNotebookPath]: {
+      value: '',
+      type: SettingItemType.String,
       public: true,
-      label: 'Global Target Note ID',
+      label: 'When creating a global note, place it in notebook',
+      description: 'Optional notebook path (e.g. “Projects/Archive”). Leave blank to create the note at the top level.',
       section: SETTINGS.section
     },
     [SETTINGS.completedNoteName]: {
       value: 'Completed Items',
       type: SettingItemType.String,
       public: true,
-      label: 'Per-notebook completed note title',
+      label: 'Per-notebook note title',
+      description: 'Used in per-notebook mode. A note with this title is created inside each notebook when needed.',
       section: SETTINGS.section
     },
     [SETTINGS.headerEnabled]: {
@@ -57,6 +81,7 @@ async function registerSettings() {
       type: SettingItemType.Bool,
       public: true,
       label: 'Prepend header',
+      description: 'Adds a header before the moved text using the template below.',
       section: SETTINGS.section
     },
     [SETTINGS.headerTemplate]: {
@@ -64,31 +89,75 @@ async function registerSettings() {
       type: SettingItemType.String,
       public: true,
       label: 'Header template',
+      description: 'Supports {{date}} or {{date:YYYY-MM-DD}}, {{title}}, {{notebook}}. Leave blank to skip headers.',
       section: SETTINGS.section
     },
     [SETTINGS.fallback]: {
       value: 'taskBlock',
       type: SettingItemType.String,
       public: true,
-      label: 'When no selection',
+      label: 'When nothing is selected',
+      description: 'Choose what to move if no text is selected.',
       section: SETTINGS.section,
-      options: { line: 'Current line', taskBlock: 'Task block', none: 'Do nothing' }
+      options: {
+        line: 'Current line',
+        taskBlock: 'Markdown task block',
+        none: 'Do nothing'
+      }
     },
     [SETTINGS.autoToggleTask]: {
       value: true,
       type: SettingItemType.Bool,
       public: true,
-      label: 'Auto toggle “- [ ]” to “- [x]” when moving a single task line',
+      label: 'Auto-complete single task lines',
+      description: 'When a lone “- [ ]” line is moved, mark it as “- [x]”.',
       section: SETTINGS.section
     },
     [SETTINGS.dateLocale]: {
       value: 'en-US',
       type: SettingItemType.String,
       public: true,
-      label: 'Date locale for {{date}}',
+      label: 'Locale for {{date}}',
+      description: 'Locale passed to toLocaleDateString when {{date}} is used without a custom format (e.g. en-US, en-GB).',
+      section: SETTINGS.section
+    },
+    [SETTINGS.commandShortcut]: {
+      value: 'Ctrl+Shift+M',
+      type: SettingItemType.String,
+      public: true,
+      label: 'Tools menu shortcut',
+      description: 'Accelerator shown next to the menu command. Restart Joplin after changing; leave blank to remove.',
       section: SETTINGS.section
     }
   });
+}
+
+async function listAllFolders(): Promise<Folder[]> {
+  const folders: Folder[] = [];
+  let page = 1;
+  while (true) {
+    const res = await joplin.data.get(['folders'], { fields: ['id', 'title', 'parent_id'], page });
+    folders.push(...((res.items || []) as Folder[]));
+    if (!res.has_more) break;
+    page += 1;
+  }
+  return folders;
+}
+
+async function resolveFolderPath(path: string): Promise<string | null> {
+  const parts = path
+    .split('/')
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  if (parts.length === 0) return null;
+  const folders = await listAllFolders();
+  let parentId = '';
+  for (const part of parts) {
+    const match = folders.find((f) => f.title === part && (f.parent_id || '') === parentId);
+    if (!match) return null;
+    parentId = match.id;
+  }
+  return parentId;
 }
 
 // Simple req/resp over window postMessage with correlation id.
@@ -140,14 +209,27 @@ async function findOrCreateTargetNote(source: Note): Promise<Note> {
     if (id) {
       try {
         const n = await joplin.data.get(['notes', id], { fields: ['id', 'title', 'body', 'parent_id'] });
+        await storeGlobalTargetNote(n as Note);
         return n as Note;
       } catch {
-        // stale id → recreate
+        await storeGlobalTargetNote(null);
       }
     }
-    const created = await joplin.data.post(['notes'], null, { title: completedTitle });
-    await joplin.settings.setValue(SETTINGS.targetNoteId, created.id);
+    const targetParentPath = ((await joplin.settings.value(SETTINGS.globalNotebookPath)) as string)?.trim();
+    let parentId: string | null = null;
+    if (targetParentPath) {
+      parentId = await resolveFolderPath(targetParentPath);
+      if (!parentId) {
+        await joplin.views.dialogs.showMessageBox(
+          `Move Selection: could not find notebook path "${targetParentPath}". The global note will be created at the top level instead.`
+        );
+      }
+    }
+    const payload: any = { title: completedTitle };
+    if (parentId) payload.parent_id = parentId;
+    const created = await joplin.data.post(['notes'], null, payload);
     const full = await joplin.data.get(['notes', created.id], { fields: ['id', 'title', 'body', 'parent_id'] });
+    await storeGlobalTargetNote(full as Note);
     return full as Note;
   } else {
     const folderId = source.parent_id;
@@ -165,6 +247,39 @@ async function findOrCreateTargetNote(source: Note): Promise<Note> {
     const created = await joplin.data.post(['notes'], null, { title: completedTitle, parent_id: folderId });
     const full = await joplin.data.get(['notes', created.id], { fields: ['id', 'title', 'body', 'parent_id'] });
     return full as Note;
+  }
+}
+
+async function storeGlobalTargetNote(note: Note | null): Promise<void> {
+  if (!note) {
+    await joplin.settings.setValue(SETTINGS.targetNoteId, '');
+    await joplin.settings.setValue(SETTINGS.targetNoteLabel, '');
+    return;
+  }
+  await joplin.settings.setValue(SETTINGS.targetNoteId, note.id);
+  let label = note.title || '(untitled note)';
+  try {
+    if (note.parent_id) {
+      const folder = (await joplin.data.get(['folders', note.parent_id], { fields: ['id', 'title'] })) as Folder;
+      if (folder?.title) label = `${label} — ${folder.title}`;
+    }
+  } catch {
+    // Optional: parent lookup failed, keep title only.
+  }
+  await joplin.settings.setValue(SETTINGS.targetNoteLabel, label);
+}
+
+async function syncGlobalTargetLabel(): Promise<void> {
+  const id = (await joplin.settings.value(SETTINGS.targetNoteId)) as string;
+  if (!id) {
+    await joplin.settings.setValue(SETTINGS.targetNoteLabel, '');
+    return;
+  }
+  try {
+    const note = (await joplin.data.get(['notes', id], { fields: ['id', 'title', 'parent_id'] })) as Note;
+    await storeGlobalTargetNote(note);
+  } catch {
+    await storeGlobalTargetNote(null);
   }
 }
 
@@ -186,6 +301,9 @@ async function prependToNote(target: Note, block: string, header: string | null)
 joplin.plugins.register({
   onStart: async () => {
     await registerSettings();
+    await syncGlobalTargetLabel();
+
+    const accelerator = ((await joplin.settings.value(SETTINGS.commandShortcut)) as string)?.trim();
 
     // Register CM bridge content script
     await joplin.contentScripts.register(
@@ -266,6 +384,40 @@ joplin.plugins.register({
       }
     });
 
-    await joplin.views.menuItems.create('msc-menu', 'moveSelectionToCompleted', MenuItemLocation.Tools);
+    await joplin.commands.register({
+      name: 'mscSetGlobalTargetToCurrent',
+      label: 'Set Global Destination to Current Note',
+      iconName: 'fas fa-thumbtack',
+      execute: async () => {
+        const note = await getSelectedNote();
+        if (!note) {
+          await joplin.views.dialogs.showMessageBox('Move Selection: select a note first.');
+          return;
+        }
+        await storeGlobalTargetNote(note);
+        await joplin.views.dialogs.showMessageBox(
+          `Global destination note set to "${note.title || '(untitled note)'}".`
+        );
+      }
+    });
+
+    await joplin.views.menuItems.create(
+      'msc-menu-move',
+      'moveSelectionToCompleted',
+      MenuItemLocation.Tools,
+      accelerator ? { accelerator } : undefined
+    );
+    await joplin.views.menuItems.create('msc-menu-set-target', 'mscSetGlobalTargetToCurrent', MenuItemLocation.Tools);
+
+    await joplin.settings.onChange(async ({ keys }) => {
+      if (keys.includes(SETTINGS.commandShortcut)) {
+        await joplin.views.dialogs.showMessageBox(
+          'Move Selection: shortcut updated. Restart Joplin to apply it to the menu.'
+        );
+      }
+      if (keys.includes(SETTINGS.targetNoteId)) {
+        await syncGlobalTargetLabel();
+      }
+    });
   }
 });
