@@ -32,50 +32,58 @@ async function registerSettings() {
       type: 2,
       public: true,
       label: 'Target mode',
+      section: SETTINGS.section,
       options: { global: 'Global (single note)', perNotebook: 'Per notebook' }
     },
     [SETTINGS.targetNoteId]: {
       value: '',
       type: 0,
       public: true,
-      label: 'Global Target Note ID'
+      label: 'Global Target Note ID',
+      section: SETTINGS.section
     },
     [SETTINGS.completedNoteName]: {
       value: 'Completed Items',
       type: 0,
       public: true,
-      label: 'Per-notebook completed note title'
+      label: 'Per-notebook completed note title',
+      section: SETTINGS.section
     },
     [SETTINGS.headerEnabled]: {
       value: true,
       type: 3,
       public: true,
-      label: 'Prepend header'
+      label: 'Prepend header',
+      section: SETTINGS.section
     },
     [SETTINGS.headerTemplate]: {
       value: '### {{date:YYYY-MM-DD}} — from "{{title}}"',
       type: 0,
       public: true,
-      label: 'Header template'
+      label: 'Header template',
+      section: SETTINGS.section
     },
     [SETTINGS.fallback]: {
       value: 'taskBlock',
       type: 2,
       public: true,
       label: 'When no selection',
+      section: SETTINGS.section,
       options: { line: 'Current line', taskBlock: 'Task block', none: 'Do nothing' }
     },
     [SETTINGS.autoToggleTask]: {
       value: true,
       type: 3,
       public: true,
-      label: 'Auto toggle “- [ ]” to “- [x]” when moving a single task line'
+      label: 'Auto toggle “- [ ]” to “- [x]” when moving a single task line',
+      section: SETTINGS.section
     },
     [SETTINGS.dateLocale]: {
       value: 'en-US',
       type: 0,
       public: true,
-      label: 'Date locale for {{date}}'
+      label: 'Date locale for {{date}}',
+      section: SETTINGS.section
     }
   });
 }
