@@ -1,11 +1,13 @@
-import joplin from 'api';
-import { ContentScriptType, MenuItemLocation } from 'api/types';
 import {
   formatHeader,
   toggleTaskIfSingleLine,
   type SelectionContext,
   type SelectionRange
 } from './utils';
+
+const joplin: any = (globalThis as any).joplin;
+const ContentScriptType = { CodeMirrorPlugin: 1 } as const;
+const MenuItemLocation = { Tools: 1 } as const;
 
 const SETTINGS = {
   section: 'msc',

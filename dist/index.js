@@ -1,30 +1,4 @@
 "use strict";
-var __create = Object.create;
-var __defProp = Object.defineProperty;
-var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
-var __getOwnPropNames = Object.getOwnPropertyNames;
-var __getProtoOf = Object.getPrototypeOf;
-var __hasOwnProp = Object.prototype.hasOwnProperty;
-var __copyProps = (to, from, except, desc) => {
-  if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
-  }
-  return to;
-};
-var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
-  // If the importer is in node compatibility mode or this is not an ESM
-  // file that has been converted to a CommonJS file using a Babel-
-  // compatible transform (i.e. "__esModule" has not been set), then set
-  // "default" to the CommonJS "module.exports" for node compatibility.
-  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
-  mod
-));
-
-// src/index.ts
-var import_api = __toESM(require("api"));
-var import_types = require("api/types");
 
 // src/utils.ts
 function formatHeader(template, opts) {
@@ -63,6 +37,9 @@ function toggleTaskIfSingleLine(block, enabled) {
 }
 
 // src/index.ts
+var joplin = globalThis.joplin;
+var ContentScriptType = { CodeMirrorPlugin: 1 };
+var MenuItemLocation = { Tools: 1 };
 var SETTINGS = {
   section: "msc",
   targetMode: "msc.targetMode",
@@ -79,60 +56,68 @@ var SETTINGS = {
   dateLocale: "msc.dateLocale"
 };
 async function registerSettings() {
-  await import_api.default.settings.registerSection(SETTINGS.section, {
+  await joplin.settings.registerSection(SETTINGS.section, {
     label: "Move Selection to Completed",
     iconName: "fas fa-check"
   });
-  await import_api.default.settings.registerSettings({
+  await joplin.settings.registerSettings({
     [SETTINGS.targetMode]: {
       value: "global",
       type: 2,
       public: true,
       label: "Target mode",
+      section: SETTINGS.section,
       options: { global: "Global (single note)", perNotebook: "Per notebook" }
     },
     [SETTINGS.targetNoteId]: {
       value: "",
       type: 0,
       public: true,
-      label: "Global Target Note ID"
+      label: "Global Target Note ID",
+      section: SETTINGS.section
     },
     [SETTINGS.completedNoteName]: {
       value: "Completed Items",
       type: 0,
       public: true,
-      label: "Per-notebook completed note title"
+      label: "Per-notebook completed note title",
+      section: SETTINGS.section
     },
     [SETTINGS.headerEnabled]: {
       value: true,
       type: 3,
       public: true,
-      label: "Prepend header"
+      label: "Prepend header",
+      section: SETTINGS.section
     },
     [SETTINGS.headerTemplate]: {
       value: '### {{date:YYYY-MM-DD}} \u2014 from "{{title}}"',
       type: 0,
       public: true,
-      label: "Header template"
+      label: "Header template",
+      section: SETTINGS.section
     },
     [SETTINGS.fallback]: {
       value: "taskBlock",
       type: 2,
       public: true,
       label: "When no selection",
+      section: SETTINGS.section,
       options: { line: "Current line", taskBlock: "Task block", none: "Do nothing" }
     },
     [SETTINGS.autoToggleTask]: {
       value: true,
       type: 3,
       public: true,
-      label: "Auto toggle \u201C- [ ]\u201D to \u201C- [x]\u201D when moving a single task line"
+      label: "Auto toggle \u201C- [ ]\u201D to \u201C- [x]\u201D when moving a single task line",
+      section: SETTINGS.section
     },
     [SETTINGS.dateLocale]: {
       value: "en-US",
       type: 0,
       public: true,
-      label: "Date locale for {{date}}"
+      label: "Date locale for {{date}}",
+      section: SETTINGS.section
     }
   });
 }
@@ -140,14 +125,14 @@ async function bridgeRequest(type, payload) {
   const id = Math.random().toString(36).slice(2);
   return new Promise(async (resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Editor bridge timeout")), 3e3);
-    const unsub = await import_api.default.window.onMessage((msg) => {
+    const unsub = await joplin.window.onMessage((msg) => {
       if (!msg || !msg.requestId || msg.requestId !== id) return;
       clearTimeout(timeout);
       unsub();
       if (msg.ok) resolve(msg.data);
       else reject(new Error(msg.error || "Bridge error"));
     });
-    await import_api.default.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
+    await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
   });
 }
 async function getSelectionContext() {
@@ -168,30 +153,30 @@ async function restoreCursorViaBridge(index) {
   await bridgeRequest("RESTORE_CURSOR", { index });
 }
 async function getSelectedNote() {
-  const note = await import_api.default.workspace.selectedNote();
+  const note = await joplin.workspace.selectedNote();
   if (!note?.id) return null;
-  const full = await import_api.default.data.get(["notes", note.id], { fields: ["id", "title", "body", "parent_id", "updated_time"] });
+  const full = await joplin.data.get(["notes", note.id], { fields: ["id", "title", "body", "parent_id", "updated_time"] });
   return full;
 }
 async function findOrCreateTargetNote(source) {
-  const mode = await import_api.default.settings.value(SETTINGS.targetMode);
-  const completedTitle = await import_api.default.settings.value(SETTINGS.completedNoteName);
+  const mode = await joplin.settings.value(SETTINGS.targetMode);
+  const completedTitle = await joplin.settings.value(SETTINGS.completedNoteName);
   if (mode === "global") {
-    let id = await import_api.default.settings.value(SETTINGS.targetNoteId);
+    let id = await joplin.settings.value(SETTINGS.targetNoteId);
     if (id) {
       try {
-        const n = await import_api.default.data.get(["notes", id], { fields: ["id", "title", "body", "parent_id"] });
+        const n = await joplin.data.get(["notes", id], { fields: ["id", "title", "body", "parent_id"] });
         return n;
       } catch {
       }
     }
-    const created = await import_api.default.data.post(["notes"], null, { title: completedTitle });
-    await import_api.default.settings.setValue(SETTINGS.targetNoteId, created.id);
-    const full = await import_api.default.data.get(["notes", created.id], { fields: ["id", "title", "body", "parent_id"] });
+    const created = await joplin.data.post(["notes"], null, { title: completedTitle });
+    await joplin.settings.setValue(SETTINGS.targetNoteId, created.id);
+    const full = await joplin.data.get(["notes", created.id], { fields: ["id", "title", "body", "parent_id"] });
     return full;
   } else {
     const folderId = source.parent_id;
-    const res = await import_api.default.data.get(["search"], {
+    const res = await joplin.data.get(["search"], {
       query: `"${completedTitle}"`,
       type: "note",
       fields: ["id", "title", "parent_id"]
@@ -199,36 +184,36 @@ async function findOrCreateTargetNote(source) {
     const items = res.items || [];
     const match = items.find((n) => n.parent_id === folderId && n.title === completedTitle);
     if (match) {
-      const full2 = await import_api.default.data.get(["notes", match.id], { fields: ["id", "title", "body", "parent_id"] });
+      const full2 = await joplin.data.get(["notes", match.id], { fields: ["id", "title", "body", "parent_id"] });
       return full2;
     }
-    const created = await import_api.default.data.post(["notes"], null, { title: completedTitle, parent_id: folderId });
-    const full = await import_api.default.data.get(["notes", created.id], { fields: ["id", "title", "body", "parent_id"] });
+    const created = await joplin.data.post(["notes"], null, { title: completedTitle, parent_id: folderId });
+    const full = await joplin.data.get(["notes", created.id], { fields: ["id", "title", "body", "parent_id"] });
     return full;
   }
 }
 async function safePutNoteBody(noteId, newBody, prevUpdated) {
-  const before = await import_api.default.data.get(["notes", noteId], { fields: ["id", "updated_time"] });
+  const before = await joplin.data.get(["notes", noteId], { fields: ["id", "updated_time"] });
   if (prevUpdated && before.updated_time && before.updated_time !== prevUpdated) {
   }
-  await import_api.default.data.put(["notes", noteId], null, { body: newBody });
+  await joplin.data.put(["notes", noteId], null, { body: newBody });
 }
 async function prependToNote(target, block, header) {
-  const current = await import_api.default.data.get(["notes", target.id], { fields: ["id", "body"] });
+  const current = await joplin.data.get(["notes", target.id], { fields: ["id", "body"] });
   const newBody = `${header ? header + "\n" : ""}${block}
 
 ${current.body || ""}`;
   await safePutNoteBody(target.id, newBody, target.updated_time);
 }
-import_api.default.plugins.register({
+joplin.plugins.register({
   onStart: async () => {
     await registerSettings();
-    await import_api.default.contentScripts.register(
-      import_types.ContentScriptType.CodeMirrorPlugin,
+    await joplin.contentScripts.register(
+      ContentScriptType.CodeMirrorPlugin,
       "msc-editor-bridge",
       "./cm-bridge.js"
     );
-    await import_api.default.commands.register({
+    await joplin.commands.register({
       name: "moveSelectionToCompleted",
       label: "Move Selection to Completed",
       iconName: "fas fa-arrow-up",
@@ -239,16 +224,16 @@ import_api.default.plugins.register({
         try {
           ctx = await getSelectionContext();
         } catch {
-          await import_api.default.views.dialogs.showMessageBox("Move Selection: editor bridge unavailable.");
+          await joplin.views.dialogs.showMessageBox("Move Selection: editor bridge unavailable.");
           return;
         }
         let movedText = ctx.text?.trimEnd() ?? "";
         let ranges = ctx.ranges || [];
         const cursorIdx = ctx.cursorIndex ?? 0;
         if (!movedText) {
-          const fb = await import_api.default.settings.value(SETTINGS.fallback);
+          const fb = await joplin.settings.value(SETTINGS.fallback);
           if (fb === "none") {
-            await import_api.default.views.dialogs.showMessageBox("Nothing selected.");
+            await joplin.views.dialogs.showMessageBox("Nothing selected.");
             return;
           }
           const fbData = fb === "line" ? await getCurrentLineViaBridge() : await getTaskBlockViaBridge();
@@ -256,18 +241,18 @@ import_api.default.plugins.register({
           ranges = fbData.ranges || [];
         }
         if (!movedText || ranges.length === 0) {
-          await import_api.default.views.dialogs.showMessageBox("Nothing to move.");
+          await joplin.views.dialogs.showMessageBox("Nothing to move.");
           return;
         }
-        const toggle = await import_api.default.settings.value(SETTINGS.autoToggleTask);
+        const toggle = await joplin.settings.value(SETTINGS.autoToggleTask);
         movedText = toggleTaskIfSingleLine(movedText, toggle);
         const updatedDocText = await cutRangesViaBridge(ranges);
         await safePutNoteBody(source.id, updatedDocText, source.updated_time);
         const target = await findOrCreateTargetNote(source);
-        const headerEnabled = await import_api.default.settings.value(SETTINGS.headerEnabled);
-        const tpl = await import_api.default.settings.value(SETTINGS.headerTemplate);
-        const locale = await import_api.default.settings.value(SETTINGS.dateLocale);
-        const folder = await import_api.default.data.get(["folders", source.parent_id], { fields: ["id", "title"] });
+        const headerEnabled = await joplin.settings.value(SETTINGS.headerEnabled);
+        const tpl = await joplin.settings.value(SETTINGS.headerTemplate);
+        const locale = await joplin.settings.value(SETTINGS.dateLocale);
+        const folder = await joplin.data.get(["folders", source.parent_id], { fields: ["id", "title"] });
         const header = headerEnabled ? formatHeader(tpl, {
           date: /* @__PURE__ */ new Date(),
           title: source.title || "",
@@ -276,9 +261,9 @@ import_api.default.plugins.register({
         }) : null;
         await prependToNote(target, movedText, header);
         await restoreCursorViaBridge(cursorIdx);
-        await import_api.default.views.dialogs.showMessageBox("Moved to Completed.");
+        await joplin.views.dialogs.showMessageBox("Moved to Completed.");
       }
     });
-    await import_api.default.views.menuItems.create("msc-menu", "moveSelectionToCompleted", import_types.MenuItemLocation.Tools);
+    await joplin.views.menuItems.create("msc-menu", "moveSelectionToCompleted", MenuItemLocation.Tools);
   }
 });
