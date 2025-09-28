@@ -7,8 +7,21 @@ import {
 
 const joplin: any = (globalThis as any).joplin;
 const ContentScriptType = { CodeMirrorPlugin: 1 } as const;
-const MenuItemLocation = { Tools: 1 } as const;
+const MenuItemLocation = {
+  Tools: 'tools',
+  NoteListContextMenu: 'noteListContextMenu'
+} as const;
 const SettingItemType = { Int: 1, String: 2, Bool: 3, Array: 4, Object: 5, Button: 6 } as const;
+
+async function removeMenuItem(id: string): Promise<void> {
+  const remover = (joplin.views.menuItems as any)?.remove;
+  if (typeof remover !== 'function') return;
+  try {
+    await remover.call(joplin.views.menuItems, id);
+  } catch {
+    // ignore missing menu
+  }
+}
 
 const SETTINGS = {
   section: 'msc',
@@ -22,7 +35,8 @@ const SETTINGS = {
   autoToggleTask: 'msc.autoToggleTask',
   completedNoteName: 'msc.completedNoteName',
   dateLocale: 'msc.dateLocale',
-  commandShortcut: 'msc.commandShortcut'
+  commandShortcut: 'msc.commandShortcut',
+  perNotebookOverrides: 'msc.perNotebookOverrides'
 };
 
 type Note = { id: string; title: string; body: string; parent_id: string; updated_time?: number };
@@ -50,8 +64,8 @@ async function registerSettings() {
       value: '',
       type: SettingItemType.String,
       public: true,
-      label: 'Global destination note',
-      description: 'Filled by the “Set Global Destination to Current Note” command. Leave blank to let the plugin create one when needed.',
+      label: 'Single destination note',
+      description: 'Filled by “Set Single Destination to Current Note”. Leave blank to let the plugin create one when needed.',
       section: SETTINGS.section
     },
     [SETTINGS.targetNoteId]: {
@@ -59,6 +73,12 @@ async function registerSettings() {
       type: SettingItemType.String,
       public: false,
       label: 'Global destination note id'
+    },
+    [SETTINGS.perNotebookOverrides]: {
+      value: {},
+      type: SettingItemType.Object,
+      public: false,
+      label: 'Notebook overrides'
     },
     [SETTINGS.globalNotebookPath]: {
       value: '',
@@ -126,7 +146,8 @@ async function registerSettings() {
       type: SettingItemType.String,
       public: true,
       label: 'Tools menu shortcut',
-      description: 'Accelerator shown next to the menu command. Restart Joplin after changing; leave blank to remove.',
+      description:
+        'Accelerator shown next to the Tools menu command (e.g. Ctrl+Alt+M). For OS-wide shortcuts, also assign one under Options → Keyboard Shortcuts.',
       section: SETTINGS.section
     }
   });
@@ -158,6 +179,19 @@ async function resolveFolderPath(path: string): Promise<string | null> {
     parentId = match.id;
   }
   return parentId;
+}
+
+async function getNotebookOverrides(): Promise<Record<string, string>> {
+  const raw = await joplin.settings.value(SETTINGS.perNotebookOverrides);
+  if (!raw || typeof raw !== 'object') return {};
+  return { ...(raw as Record<string, string>) };
+}
+
+async function setNotebookOverride(folderId: string, noteId: string | null): Promise<void> {
+  const overrides = await getNotebookOverrides();
+  if (noteId) overrides[folderId] = noteId;
+  else delete overrides[folderId];
+  await joplin.settings.setValue(SETTINGS.perNotebookOverrides, overrides);
 }
 
 // Simple req/resp over window postMessage with correlation id.
@@ -201,6 +235,22 @@ async function getSelectedNote(): Promise<Note | null> {
   return full as Note;
 }
 
+async function getNoteFromContext(context: any): Promise<Note | null> {
+  const noteIds: string[] = context?.noteIds || (context?.noteId ? [context.noteId] : []);
+  const id = noteIds?.[0];
+  if (id) {
+    try {
+      const note = await joplin.data.get(['notes', id], {
+        fields: ['id', 'title', 'body', 'parent_id', 'updated_time']
+      });
+      return note as Note;
+    } catch {
+      // ignore
+    }
+  }
+  return getSelectedNote();
+}
+
 async function findOrCreateTargetNote(source: Note): Promise<Note> {
   const mode = await joplin.settings.value(SETTINGS.targetMode);
   const completedTitle = (await joplin.settings.value(SETTINGS.completedNoteName)) as string;
@@ -233,6 +283,19 @@ async function findOrCreateTargetNote(source: Note): Promise<Note> {
     return full as Note;
   } else {
     const folderId = source.parent_id;
+    const overrides = await getNotebookOverrides();
+    const overrideId = overrides[folderId];
+    if (overrideId) {
+      try {
+        const overrideNote = (await joplin.data.get(['notes', overrideId], {
+          fields: ['id', 'title', 'body', 'parent_id']
+        })) as Note;
+        if (overrideNote.parent_id === folderId) return overrideNote;
+      } catch {
+        // stale override
+      }
+      await setNotebookOverride(folderId, null);
+    }
     const res = await joplin.data.get(['search'], {
       query: `"${completedTitle}"`,
       type: 'note',
@@ -267,6 +330,16 @@ async function storeGlobalTargetNote(note: Note | null): Promise<void> {
     // Optional: parent lookup failed, keep title only.
   }
   await joplin.settings.setValue(SETTINGS.targetNoteLabel, label);
+}
+
+async function getFolderTitle(folderId: string): Promise<string> {
+  try {
+    const folder = (await joplin.data.get(['folders', folderId], { fields: ['id', 'title'] })) as Folder;
+    if (folder?.title) return folder.title;
+  } catch {
+    // ignore
+  }
+  return '(unknown notebook)';
 }
 
 async function syncGlobalTargetLabel(): Promise<void> {
@@ -385,35 +458,120 @@ joplin.plugins.register({
     });
 
     await joplin.commands.register({
-      name: 'mscSetGlobalTargetToCurrent',
-      label: 'Set Global Destination to Current Note',
+      name: 'mscSetSingleDestinationToCurrent',
+      label: 'Set Single Destination to Current Note',
       iconName: 'fas fa-thumbtack',
-      execute: async () => {
-        const note = await getSelectedNote();
+      execute: async (context?: any) => {
+        const note = await getNoteFromContext(context);
         if (!note) {
           await joplin.views.dialogs.showMessageBox('Move Selection: select a note first.');
           return;
         }
         await storeGlobalTargetNote(note);
         await joplin.views.dialogs.showMessageBox(
-          `Global destination note set to "${note.title || '(untitled note)'}".`
+          `Single destination set to "${note.title || '(untitled note)'}".`
         );
       }
     });
 
-    await joplin.views.menuItems.create(
-      'msc-menu-move',
-      'moveSelectionToCompleted',
-      MenuItemLocation.Tools,
-      accelerator ? { accelerator } : undefined
-    );
-    await joplin.views.menuItems.create('msc-menu-set-target', 'mscSetGlobalTargetToCurrent', MenuItemLocation.Tools);
+    await joplin.commands.register({
+      name: 'mscSetNotebookDestinationToCurrent',
+      label: 'Set Notebook Destination to Current Note',
+      iconName: 'fas fa-folder-open',
+      execute: async (context?: any) => {
+        const note = await getNoteFromContext(context);
+        if (!note) {
+          await joplin.views.dialogs.showMessageBox('Move Selection: select a note first.');
+          return;
+        }
+        if (!note.parent_id) {
+          await joplin.views.dialogs.showMessageBox('Move Selection: note is missing a parent notebook.');
+          return;
+        }
+        await setNotebookOverride(note.parent_id, note.id);
+        const folderTitle = await getFolderTitle(note.parent_id);
+        await joplin.views.dialogs.showMessageBox(
+          `Notebook destination for "${folderTitle}" set to "${note.title || '(untitled note)'}".`
+        );
+      }
+    });
+
+    await joplin.commands.register({
+      name: 'mscClearNotebookDestination',
+      label: 'Clear Notebook Destination Override',
+      iconName: 'fas fa-eraser',
+      execute: async (context?: any) => {
+        let note = await getNoteFromContext(context);
+        let folderId = note?.parent_id;
+        let folderTitle = folderId ? await getFolderTitle(folderId) : '';
+        if (!folderId) {
+          const folder = await joplin.workspace.selectedFolder();
+          if (folder?.id) {
+            folderId = folder.id;
+            folderTitle = folder.title || folderTitle;
+          }
+        }
+        if (!folderId) {
+          await joplin.views.dialogs.showMessageBox(
+            'Move Selection: select a note (or notebook) first to clear its override.'
+          );
+          return;
+        }
+        await setNotebookOverride(folderId, null);
+        if (!folderTitle) folderTitle = await getFolderTitle(folderId);
+        await joplin.views.dialogs.showMessageBox(
+          `Notebook destination override cleared for "${folderTitle}".`
+        );
+      }
+    });
+
+    const createMenus = async (acc?: string) => {
+      await removeMenuItem('msc-menu-move');
+      await removeMenuItem('msc-menu-set-single');
+      await removeMenuItem('msc-menu-set-notebook');
+      await removeMenuItem('msc-menu-clear-notebook');
+      await removeMenuItem('msc-context-set-notebook');
+      await removeMenuItem('msc-context-clear-notebook');
+
+      await joplin.views.menuItems.create(
+        'msc-menu-move',
+        'moveSelectionToCompleted',
+        MenuItemLocation.Tools,
+        acc ? { accelerator: acc } : undefined
+      );
+      await joplin.views.menuItems.create(
+        'msc-menu-set-single',
+        'mscSetSingleDestinationToCurrent',
+        MenuItemLocation.Tools
+      );
+      await joplin.views.menuItems.create(
+        'msc-menu-set-notebook',
+        'mscSetNotebookDestinationToCurrent',
+        MenuItemLocation.Tools
+      );
+      await joplin.views.menuItems.create(
+        'msc-menu-clear-notebook',
+        'mscClearNotebookDestination',
+        MenuItemLocation.Tools
+      );
+      await joplin.views.menuItems.create(
+        'msc-context-set-notebook',
+        'mscSetNotebookDestinationToCurrent',
+        MenuItemLocation.NoteListContextMenu
+      );
+      await joplin.views.menuItems.create(
+        'msc-context-clear-notebook',
+        'mscClearNotebookDestination',
+        MenuItemLocation.NoteListContextMenu
+      );
+    };
+
+    await createMenus(accelerator);
 
     await joplin.settings.onChange(async ({ keys }) => {
       if (keys.includes(SETTINGS.commandShortcut)) {
-        await joplin.views.dialogs.showMessageBox(
-          'Move Selection: shortcut updated. Restart Joplin to apply it to the menu.'
-        );
+        const acc = ((await joplin.settings.value(SETTINGS.commandShortcut)) as string)?.trim();
+        await createMenus(acc);
       }
       if (keys.includes(SETTINGS.targetNoteId)) {
         await syncGlobalTargetLabel();
