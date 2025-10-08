@@ -37,9 +37,57 @@ function toggleTaskIfSingleLine(block, enabled) {
 }
 
 // src/index.ts
-var joplin = globalThis.joplin;
+function resolveJoplinApi() {
+  if (typeof require === "function") {
+    try {
+      const mod = require("api");
+      if (mod?.default) return mod.default;
+      if (mod) return mod;
+    } catch (err) {
+      console.info(
+        '[MSC debug] require("api") unavailable:',
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+  const legacy = globalThis?.joplin;
+  if (legacy) return legacy;
+  throw new Error("Joplin API unavailable");
+}
+var joplin = resolveJoplinApi();
 var ContentScriptType = { CodeMirrorPlugin: 1 };
 var MenuItemLocation = { Tools: 1 };
+function getWindowApi() {
+  try {
+    return joplin.window ?? null;
+  } catch {
+    return null;
+  }
+}
+async function tryInvokeWindow(name, ...args) {
+  const win = getWindowApi();
+  if (!win) return { ok: false };
+  let method;
+  try {
+    method = win[name];
+  } catch (err) {
+    console.info(`[MSC debug] window.${name} unavailable:`, err?.message || err);
+    return { ok: false };
+  }
+  if (typeof method !== "function") {
+    if (method !== void 0) {
+      console.info(`[MSC debug] window.${name} not callable (type: ${typeof method})`);
+    }
+    return { ok: false };
+  }
+  try {
+    const result = await Reflect.apply(method, win, args);
+    return { ok: true, result };
+  } catch (err) {
+    console.info(`[MSC debug] window.${name} call failed:`, err?.message || err);
+    return { ok: false };
+  }
+}
 var SETTINGS = {
   section: "msc",
   targetMode: "msc.targetMode",
@@ -123,16 +171,66 @@ async function registerSettings() {
 }
 async function bridgeRequest(type, payload) {
   const id = Math.random().toString(36).slice(2);
-  return new Promise(async (resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Editor bridge timeout")), 3e3);
-    const unsub = await joplin.window.onMessage((msg) => {
+  return new Promise((resolve, reject) => {
+    let unsub = null;
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      if (unsub) {
+        try {
+          unsub();
+        } catch {
+        }
+      }
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Editor bridge timeout"));
+    }, 3e3);
+    const handleMessage = (msg) => {
       if (!msg || !msg.requestId || msg.requestId !== id) return;
       clearTimeout(timeout);
-      unsub();
+      cleanup();
       if (msg.ok) resolve(msg.data);
       else reject(new Error(msg.error || "Bridge error"));
+    };
+    (async () => {
+      const subRes = await tryInvokeWindow("onMessage", handleMessage);
+      if (!subRes.ok) {
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            "Unable to communicate with editor bridge. Click into the note editor and try again."
+          )
+        );
+        return;
+      }
+      if (typeof subRes.result === "function") {
+        unsub = () => {
+          try {
+            subRes.result();
+          } catch {
+          }
+        };
+      }
+      const postRes = await tryInvokeWindow("postMessage", {
+        __MSC_REQ__: { type, requestId: id, payload }
+      });
+      if (!postRes.ok) {
+        clearTimeout(timeout);
+        cleanup();
+        reject(
+          new Error(
+            "Unable to communicate with editor bridge. Please update Joplin to 2.14+ so content script messaging is available."
+          )
+        );
+      }
+    })().catch((err) => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
     });
-    await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
   });
 }
 async function getSelectionContext() {
@@ -223,13 +321,15 @@ joplin.plugins.register({
         let ctx;
         try {
           ctx = await getSelectionContext();
-        } catch {
-          await joplin.views.dialogs.showMessageBox("Move Selection: editor bridge unavailable.");
+        } catch (err) {
+          const msg = err?.message ? `Move Selection: ${err.message}` : "Move Selection: editor bridge unavailable. Click into the note editor and try again.";
+          await joplin.views.dialogs.showMessageBox(msg);
           return;
         }
         let movedText = ctx.text?.trimEnd() ?? "";
         let ranges = ctx.ranges || [];
         const cursorIdx = ctx.cursorIndex ?? 0;
+        let editorImpl = ctx.impl;
         if (!movedText) {
           const fb = await joplin.settings.value(SETTINGS.fallback);
           if (fb === "none") {
@@ -239,6 +339,7 @@ joplin.plugins.register({
           const fbData = fb === "line" ? await getCurrentLineViaBridge() : await getTaskBlockViaBridge();
           movedText = (fbData.text || "").trimEnd();
           ranges = fbData.ranges || [];
+          editorImpl = fbData.impl ?? editorImpl;
         }
         if (!movedText || ranges.length === 0) {
           await joplin.views.dialogs.showMessageBox("Nothing to move.");
@@ -247,7 +348,14 @@ joplin.plugins.register({
         const toggle = await joplin.settings.value(SETTINGS.autoToggleTask);
         movedText = toggleTaskIfSingleLine(movedText, toggle);
         const updatedDocText = await cutRangesViaBridge(ranges);
-        await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+        if (editorImpl === "tinymce") {
+          try {
+            await joplin.commands.execute("editor.save");
+          } catch {
+          }
+        } else {
+          await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+        }
         const target = await findOrCreateTargetNote(source);
         const headerEnabled = await joplin.settings.value(SETTINGS.headerEnabled);
         const tpl = await joplin.settings.value(SETTINGS.headerTemplate);
@@ -261,7 +369,6 @@ joplin.plugins.register({
         }) : null;
         await prependToNote(target, movedText, header);
         await restoreCursorViaBridge(cursorIdx);
-        await joplin.views.dialogs.showMessageBox("Moved to Completed.");
       }
     });
     await joplin.views.menuItems.create("msc-menu", "moveSelectionToCompleted", MenuItemLocation.Tools);

@@ -4,6 +4,7 @@ export type SelectionContext = {
   ranges: SelectionRange[];
   cursorIndex: number;
   docText: string;
+  impl?: string;
 };
 
 export function formatHeader(

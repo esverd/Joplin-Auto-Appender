@@ -5,9 +5,66 @@ import {
   type SelectionRange
 } from './utils';
 
-const joplin: any = (globalThis as any).joplin;
+declare const require: undefined | ((id: string) => any);
+
+function resolveJoplinApi(): any {
+  if (typeof require === 'function') {
+    try {
+      const mod = require('api');
+      if (mod?.default) return mod.default;
+      if (mod) return mod;
+    } catch (err) {
+      // Fall back to legacy global injection below.
+      console.info(
+        '[MSC debug] require("api") unavailable:',
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+  const legacy = (globalThis as any)?.joplin;
+  if (legacy) return legacy;
+  throw new Error('Joplin API unavailable');
+}
+
+const joplin: any = resolveJoplinApi();
 const ContentScriptType = { CodeMirrorPlugin: 1 } as const;
 const MenuItemLocation = { Tools: 1 } as const;
+
+function getWindowApi(): any | null {
+  try {
+    return (joplin as any).window ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function tryInvokeWindow(
+  name: 'onMessage' | 'postMessage',
+  ...args: any[]
+): Promise<{ ok: boolean; result?: any }> {
+  const win = getWindowApi();
+  if (!win) return { ok: false };
+  let method: any;
+  try {
+    method = win[name];
+  } catch (err: any) {
+    console.info(`[MSC debug] window.${name} unavailable:`, err?.message || err);
+    return { ok: false };
+  }
+  if (typeof method !== 'function') {
+    if (method !== undefined) {
+      console.info(`[MSC debug] window.${name} not callable (type: ${typeof method})`);
+    }
+    return { ok: false };
+  }
+  try {
+    const result = await Reflect.apply(method, win, args);
+    return { ok: true, result };
+  } catch (err: any) {
+    console.info(`[MSC debug] window.${name} call failed:`, err?.message || err);
+    return { ok: false };
+  }
+}
 
 const SETTINGS = {
   section: 'msc',
@@ -93,16 +150,73 @@ async function registerSettings() {
 // Simple req/resp over window postMessage with correlation id.
 async function bridgeRequest(type: string, payload?: any): Promise<any> {
   const id = Math.random().toString(36).slice(2);
-  return new Promise(async (resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Editor bridge timeout')), 3000);
-    const unsub = await joplin.window.onMessage((msg: any) => {
+  return new Promise((resolve, reject) => {
+    let unsub: (() => void) | null = null;
+    let settled = false;
+
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      if (unsub) {
+        try {
+          unsub();
+        } catch {
+          // ignore listener cleanup errors
+        }
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Editor bridge timeout'));
+    }, 3000);
+
+    const handleMessage = (msg: any) => {
       if (!msg || !msg.requestId || msg.requestId !== id) return;
       clearTimeout(timeout);
-      unsub();
+      cleanup();
       if (msg.ok) resolve(msg.data);
       else reject(new Error(msg.error || 'Bridge error'));
+    };
+
+    (async () => {
+      const subRes = await tryInvokeWindow('onMessage', handleMessage);
+      if (!subRes.ok) {
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            'Unable to communicate with editor bridge. Click into the note editor and try again.'
+          )
+        );
+        return;
+      }
+      if (typeof subRes.result === 'function') {
+        unsub = () => {
+          try {
+            subRes.result();
+          } catch {
+            /* noop */
+          }
+        };
+      }
+
+      const postRes = await tryInvokeWindow('postMessage', {
+        __MSC_REQ__: { type, requestId: id, payload }
+      });
+      if (!postRes.ok) {
+        clearTimeout(timeout);
+        cleanup();
+        reject(
+          new Error(
+            'Unable to communicate with editor bridge. Please update Joplin to 2.14+ so content script messaging is available.'
+          )
+        );
+      }
+    })().catch((err) => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
     });
-    await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
   });
 }
 
@@ -110,10 +224,18 @@ async function getSelectionContext(): Promise<SelectionContext> {
   const data = await bridgeRequest('GET_SELECTION_CONTEXT');
   return data as SelectionContext;
 }
-async function getCurrentLineViaBridge(): Promise<{ text: string; ranges: SelectionRange[] }> {
+async function getCurrentLineViaBridge(): Promise<{
+  text: string;
+  ranges: SelectionRange[];
+  impl?: string;
+}> {
   return bridgeRequest('GET_CURRENT_LINE');
 }
-async function getTaskBlockViaBridge(): Promise<{ text: string; ranges: SelectionRange[] }> {
+async function getTaskBlockViaBridge(): Promise<{
+  text: string;
+  ranges: SelectionRange[];
+  impl?: string;
+}> {
   return bridgeRequest('GET_TASK_BLOCK');
 }
 async function cutRangesViaBridge(ranges: SelectionRange[]): Promise<string> {
@@ -205,14 +327,18 @@ joplin.plugins.register({
         let ctx: SelectionContext;
         try {
           ctx = await getSelectionContext();
-        } catch {
-          await joplin.views.dialogs.showMessageBox('Move Selection: editor bridge unavailable.');
+        } catch (err: any) {
+          const msg = err?.message
+            ? `Move Selection: ${err.message}`
+            : 'Move Selection: editor bridge unavailable. Click into the note editor and try again.';
+          await joplin.views.dialogs.showMessageBox(msg);
           return;
         }
 
         let movedText = ctx.text?.trimEnd() ?? '';
         let ranges: SelectionRange[] = ctx.ranges || [];
         const cursorIdx = ctx.cursorIndex ?? 0;
+        let editorImpl = ctx.impl;
 
         // 2) Fallback if empty selection
         if (!movedText) {
@@ -225,6 +351,7 @@ joplin.plugins.register({
             fb === 'line' ? await getCurrentLineViaBridge() : await getTaskBlockViaBridge();
           movedText = (fbData.text || '').trimEnd();
           ranges = fbData.ranges || [];
+          editorImpl = fbData.impl ?? editorImpl;
         }
         if (!movedText || ranges.length === 0) {
           await joplin.views.dialogs.showMessageBox('Nothing to move.');
@@ -237,7 +364,15 @@ joplin.plugins.register({
 
         // 4) Cut ranges from editor buffer; persist source note body
         const updatedDocText = await cutRangesViaBridge(ranges);
-        await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+        if (editorImpl === 'tinymce') {
+          try {
+            await joplin.commands.execute('editor.save');
+          } catch {
+            // ignore – rich text editor syncs automatically
+          }
+        } else {
+          await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+        }
 
         // 5) Resolve target note
         const target = await findOrCreateTargetNote(source);
@@ -261,7 +396,6 @@ joplin.plugins.register({
 
         // 8) Restore cursor, notify
         await restoreCursorViaBridge(cursorIdx);
-        await joplin.views.dialogs.showMessageBox('Moved to Completed.');
       }
     });
 
