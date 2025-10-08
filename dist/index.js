@@ -38,6 +38,8 @@ function toggleTaskIfSingleLine(block, enabled) {
 
 // src/index.ts
 function resolveJoplinApi() {
+  const legacy = globalThis?.joplin;
+  if (legacy) return legacy;
   if (typeof require === "function") {
     try {
       const mod = require("api");
@@ -50,8 +52,6 @@ function resolveJoplinApi() {
       );
     }
   }
-  const legacy = globalThis?.joplin;
-  if (legacy) return legacy;
   throw new Error("Joplin API unavailable");
 }
 var joplin = resolveJoplinApi();
