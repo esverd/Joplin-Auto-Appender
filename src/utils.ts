@@ -4,7 +4,9 @@ export type SelectionContext = {
   ranges: SelectionRange[];
   cursorIndex: number;
   docText: string;
-  impl?: string;
+  impl?: 'cm6' | 'cm5' | 'tinymce';
+  docHtml?: string;
+  html?: string;
 };
 
 export function formatHeader(

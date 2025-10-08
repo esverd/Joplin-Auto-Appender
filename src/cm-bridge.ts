@@ -1,19 +1,44 @@
-/* Content script runs in the editor (CodeMirror 6 in current Joplin).
-   We expose functions callable via postMessage protocol.
-   Why: direct API differences across CM versions; message bridge stays stable. */
+/* Content script runs inside the note editor (CodeMirror or TinyMCE).
+   We expose editor operations callable via the plugin through a simple
+   message bridge that works across the different editor implementations. */
 type Range = { from: number; to: number };
 
-const Bridge = (() => {
-  let lastCursorIndex = 0;
+type SelectionPayload = {
+  impl: 'cm6' | 'cm5' | 'tinymce';
+  text: string;
+  ranges: Range[];
+  cursorIndex: number;
+  docText: string;
+  docHtml?: string;
+  html?: string;
+};
 
-  function getDocAndSelection() {
-    // Joplin injects CodeMirror; CM6 stores state on window.cm6?. We try both CM6 and CM5.
+const webviewApi = (window as any).webviewApi;
+
+type TinymceCtx = {
+  editor: any;
+  range: globalThis.Range | null;
+  bookmark: any;
+};
+
+type LastContext =
+  | { impl: 'cm6'; view: any }
+  | { impl: 'cm5'; cm: any }
+  | ({ impl: 'tinymce' } & TinymceCtx)
+  | null;
+
+let lastContext: LastContext = null;
+
+const Bridge = (() => {
+  function getDocAndSelection(): SelectionPayload {
     const w = window as any;
     const cm6 = w.cm6;
     const cm5 = w.cm;
-    if (cm6 && cm6.view) {
-      const v = cm6.view;
-      const state = v.state;
+    const rte = getTinymceEditor();
+
+    if (cm6?.view) {
+      const view = cm6.view;
+      const state = view.state;
       const ranges: Range[] = [];
       let text = '';
       for (const r of state.selection.ranges) {
@@ -21,10 +46,17 @@ const Bridge = (() => {
         text += state.sliceDoc(r.from, r.to);
       }
       const docText = state.doc.toString();
-      lastCursorIndex = state.selection.main.head;
-      return { impl: 'cm6', ranges, text, cursorIndex: lastCursorIndex, docText, view: v };
+      lastContext = { impl: 'cm6', view };
+      return {
+        impl: 'cm6',
+        ranges,
+        text,
+        cursorIndex: state.selection.main.head,
+        docText
+      };
     }
-    if (cm5 && cm5.instance) {
+
+    if (cm5?.instance) {
       const cm = cm5.instance;
       const doc = cm.getDoc();
       const sels = doc.listSelections();
@@ -35,25 +67,62 @@ const Bridge = (() => {
       const text = doc.getSelection();
       const docText = doc.getValue();
       const cursor = doc.getCursor();
-      lastCursorIndex = doc.indexFromPos(cursor);
-      return { impl: 'cm5', ranges, text, cursorIndex: lastCursorIndex, docText, cm };
+      lastContext = { impl: 'cm5', cm };
+      return {
+        impl: 'cm5',
+        ranges,
+        text,
+        cursorIndex: doc.indexFromPos(cursor),
+        docText
+      };
     }
-    throw new Error('No supported editor instance found');
+
+    if (rte) {
+      const selection = rte.selection;
+      let rng: globalThis.Range | null = null;
+      try {
+        rng = selection?.getRng?.().cloneRange() ?? null;
+      } catch {
+        rng = null;
+      }
+      const bookmark = selection?.getBookmark?.(2, true) ?? null;
+      lastContext = { impl: 'tinymce', editor: rte, range: rng, bookmark };
+      const text = selection?.getContent?.({ format: 'text' }) || '';
+      const docText = rte.getContent({ format: 'text' }) || '';
+      const docHtml = rte.getContent({ format: 'html' }) || '';
+      const html = selection?.getContent?.({ format: 'html' }) || '';
+      return {
+        impl: 'tinymce',
+        ranges: [{ from: 0, to: text.length }],
+        text,
+        cursorIndex: 0,
+        docText,
+        docHtml,
+        html
+      };
+    }
+
+    const flags = {
+      cm6: !!cm6?.view,
+      cm5: !!cm5?.instance,
+      tinymce: !!((window as any).tinymce?.activeEditor)
+    };
+    throw new Error(`No supported editor instance found (cm6:${flags.cm6} cm5:${flags.cm5} tinymce:${flags.tinymce})`);
   }
 
-  function cutRanges(ranges: Range[]) {
+  function cutRanges(ranges: Range[]): string {
     const info = getDocAndSelection();
-    // Normalize and cut from end to start to keep indexes valid.
-    const norm = ranges
-      .map((r) => ({ from: Math.min(r.from, r.to), to: Math.max(r.from, r.to) }))
-      .sort((a, b) => b.from - a.from);
-    if (info.impl === 'cm6') {
-      info.view.dispatch({
-        changes: norm.map((r) => ({ from: r.from, to: r.to, insert: '' }))
-      });
-      return info.view.state.doc.toString();
-    } else {
-      const doc = info.cm.getDoc();
+    if (info.impl === 'cm6' && lastContext?.impl === 'cm6') {
+      const view = lastContext.view;
+      const norm = normalizeRanges(ranges);
+      view.dispatch({ changes: norm.map((r) => ({ from: r.from, to: r.to, insert: '' })) });
+      return view.state.doc.toString();
+    }
+
+    if (info.impl === 'cm5' && lastContext?.impl === 'cm5') {
+      const cm = lastContext.cm;
+      const doc = cm.getDoc();
+      const norm = normalizeRanges(ranges);
       norm.forEach((r) => {
         const from = doc.posFromIndex(r.from);
         const to = doc.posFromIndex(r.to);
@@ -61,78 +130,116 @@ const Bridge = (() => {
       });
       return doc.getValue();
     }
+
+    if (info.impl === 'tinymce' && lastContext?.impl === 'tinymce') {
+      const editor = getTinymceEditor();
+      if (!editor) throw new Error('Rich text editor unavailable');
+      const ctx = lastContext as TinymceCtx & { impl: 'tinymce' };
+      editor.undoManager.transact(() => {
+        if (ctx.range) editor.selection.setRng(ctx.range);
+        editor.selection.setContent('');
+      });
+      ctx.range = editor.selection?.getRng?.()?.cloneRange?.() ?? null;
+      ctx.bookmark = editor.selection?.getBookmark?.(2, true) ?? ctx.bookmark;
+      return editor.getContent({ format: 'text' }) || '';
+    }
+
+    throw new Error('Unable to cut selection');
   }
 
-  function getCurrentLine(): { text: string; range: Range; impl: string } {
+  function getCurrentLine(): { text: string; range: Range; impl: SelectionPayload['impl'] } {
     const info = getDocAndSelection();
-    if (info.impl === 'cm6') {
-      const line = info.view.state.doc.lineAt(info.cursorIndex);
-      return { text: line.text, range: { from: line.from, to: line.to }, impl: info.impl };
-    } else {
-      const doc = info.cm.getDoc();
+    if (info.impl === 'cm6' && lastContext?.impl === 'cm6') {
+      const line = lastContext.view.state.doc.lineAt(info.cursorIndex);
+      return { text: line.text, range: { from: line.from, to: line.to }, impl: 'cm6' };
+    }
+    if (info.impl === 'cm5' && lastContext?.impl === 'cm5') {
+      const doc = lastContext.cm.getDoc();
       const cur = doc.getCursor();
       const lineText = doc.getLine(cur.line);
       const from = doc.indexFromPos({ line: cur.line, ch: 0 });
       const to = doc.indexFromPos({ line: cur.line, ch: lineText.length });
-      return { text: lineText, range: { from, to }, impl: info.impl };
+      return { text: lineText, range: { from, to }, impl: 'cm5' };
     }
+    if (info.impl === 'tinymce') {
+      const editor = getTinymceEditor();
+      if (!editor) throw new Error('Rich text editor unavailable');
+      const block = getCurrentBlock(editor);
+      if (!block) throw new Error('Unable to detect current block');
+      const text = getBlockText(block);
+      selectElements(editor, [block]);
+      return { text, range: { from: 0, to: text.length }, impl: 'tinymce' };
+    }
+    throw new Error('Unable to read current line');
   }
 
-  function isTaskLine(s: string) {
-    return /^\s*-\s\[( |x|X)\]\s/.test(s);
-  }
-
-  function getTaskBlock(): { text: string; range: Range; impl: string } {
-    // Expand to contiguous TODO lines around cursor.
+  function getTaskBlock(): { text: string; range: Range; impl: SelectionPayload['impl'] } {
     const info = getDocAndSelection();
-    const text = info.docText;
-    // Compute line starts.
-    const lines = text.split(/\r?\n/);
-    const starts: number[] = [];
-    let idx = 0;
-    for (const l of lines) {
-      starts.push(idx);
-      idx += l.length + 1;
+    if (info.impl === 'cm6' && lastContext?.impl === 'cm6') {
+      const data = expandTaskBlock(info.docText, info.cursorIndex);
+      return { text: data.text, range: data.range, impl: 'cm6' };
     }
-
-    const cur = info.cursorIndex;
-    let lineIdx = lines.length - 1;
-    for (let i = 0; i < starts.length; i++) {
-      if (starts[i] > cur) {
-        lineIdx = i - 1;
-        break;
+    if (info.impl === 'cm5' && lastContext?.impl === 'cm5') {
+      const doc = lastContext.cm.getDoc();
+      const docText = doc.getValue();
+      const cursorIndex = doc.indexFromPos(doc.getCursor());
+      const data = expandTaskBlock(docText, cursorIndex);
+      return { text: data.text, range: data.range, impl: 'cm5' };
+    }
+    if (info.impl === 'tinymce') {
+      const editor = getTinymceEditor();
+      if (!editor) throw new Error('Rich text editor unavailable');
+      const block = getCurrentBlock(editor);
+      if (!block) throw new Error('Unable to detect current block');
+      if (block.tagName?.toLowerCase() !== 'li') {
+        const text = getBlockText(block);
+        selectElements(editor, [block]);
+        return { text, range: { from: 0, to: text.length }, impl: 'tinymce' };
       }
-      if (i === starts.length - 1) lineIdx = i;
+      const items = Array.from(block.parentElement?.children || []) as HTMLElement[];
+      const idx = items.indexOf(block as HTMLElement);
+      let top = idx;
+      let bot = idx;
+      while (top > 0 && isListTask(items[top - 1])) top--;
+      while (bot < items.length - 1 && isListTask(items[bot + 1])) bot++;
+      const slice = items.slice(top, bot + 1);
+      const text = slice.map(getBlockText).join('\n');
+      selectElements(editor, slice);
+      return { text, range: { from: 0, to: text.length }, impl: 'tinymce' };
     }
-
-    const isTodo = (i: number) => i >= 0 && i < lines.length && isTaskLine(lines[i]);
-
-    if (!isTodo(lineIdx)) {
-      // Fallback to current line if not a task line.
-      const lstart = starts[lineIdx];
-      const lend = lstart + lines[lineIdx].length;
-      return { text: lines[lineIdx], range: { from: lstart, to: lend }, impl: info.impl };
-    }
-
-    let top = lineIdx;
-    let bot = lineIdx;
-    while (isTodo(top - 1)) top--;
-    while (isTodo(bot + 1)) bot++;
-
-    const from = starts[top];
-    const to = starts[bot] + lines[bot].length;
-    const block = lines.slice(top, bot + 1).join('\n');
-    return { text: block, range: { from, to }, impl: info.impl };
+    throw new Error('Unable to read task block');
   }
 
   function setCursor(index: number) {
     const info = getDocAndSelection();
-    if (info.impl === 'cm6') {
-      info.view.dispatch({ selection: { anchor: index, head: index }, scrollIntoView: true });
-    } else {
-      const doc = info.cm.getDoc();
+    if (info.impl === 'cm6' && lastContext?.impl === 'cm6') {
+      lastContext.view.dispatch({ selection: { anchor: index, head: index }, scrollIntoView: true });
+      return;
+    }
+    if (info.impl === 'cm5' && lastContext?.impl === 'cm5') {
+      const doc = lastContext.cm.getDoc();
       const pos = doc.posFromIndex(index);
       doc.setCursor(pos);
+      return;
+    }
+    if (info.impl === 'tinymce') {
+      const editor = getTinymceEditor();
+      if (!editor) return;
+      const ctx = lastContext as TinymceCtx & { impl: 'tinymce' };
+      if (ctx.bookmark) {
+        try {
+          editor.selection.moveToBookmark(ctx.bookmark);
+          editor.selection.collapse(true);
+          return;
+        } catch {
+          // ignore bookmark issues, fall back to range
+        }
+      }
+      if (ctx.range) {
+        const caret = ctx.range.cloneRange();
+        caret.collapse(true);
+        editor.selection.setRng(caret);
+      }
     }
   }
 
@@ -143,17 +250,7 @@ const Bridge = (() => {
         switch (type) {
           case 'GET_SELECTION_CONTEXT': {
             const ctx = getDocAndSelection();
-            post({
-              requestId,
-              ok: true,
-              data: {
-                text: ctx.text,
-                ranges: ctx.ranges,
-                cursorIndex: ctx.cursorIndex,
-                docText: ctx.docText,
-                impl: ctx.impl
-              }
-            });
+            post({ requestId, ok: true, data: ctx });
             break;
           }
           case 'GET_CURRENT_LINE': {
@@ -184,17 +281,129 @@ const Bridge = (() => {
       }
     }
   };
-
-  function post(obj: any) {
-    // Joplin injects 'postMessage' for content scripts
-    (window as any).postMessage(obj, '*');
-  }
 })();
 
-// Listen to plugin messages via window message bus.
-// Why: cross-version safe; Joplin forwards postMessage between plugin and editor.
-window.addEventListener('message', (ev) => {
-  const data = ev.data || {};
-  if (!data || !data.__MSC_REQ__) return;
-  Bridge.handleMessage(data.__MSC_REQ__);
-});
+function normalizeRanges(ranges: Range[]): Range[] {
+  return ranges
+    .map((r) => ({ from: Math.min(r.from, r.to), to: Math.max(r.from, r.to) }))
+    .sort((a, b) => b.from - a.from);
+}
+
+function expandTaskBlock(docText: string, cursorIndex: number) {
+  const lines = docText.split(/\r?\n/);
+  const starts: number[] = [];
+  let idx = 0;
+  for (const line of lines) {
+    starts.push(idx);
+    idx += line.length + 1;
+  }
+  let lineIdx = lines.length - 1;
+  for (let i = 0; i < starts.length; i++) {
+    if (starts[i] > cursorIndex) {
+      lineIdx = i - 1;
+      break;
+    }
+    if (i === starts.length - 1) lineIdx = i;
+  }
+  const isTodo = (i: number) => i >= 0 && i < lines.length && /^\s*-\s\[( |x|X)\]\s/.test(lines[i]);
+  if (!isTodo(lineIdx)) {
+    const lstart = starts[lineIdx];
+    const lend = lstart + lines[lineIdx].length;
+    return { text: lines[lineIdx], range: { from: lstart, to: lend } };
+  }
+  let top = lineIdx;
+  let bot = lineIdx;
+  while (isTodo(top - 1)) top--;
+  while (isTodo(bot + 1)) bot++;
+  const from = starts[top];
+  const to = starts[bot] + lines[bot].length;
+  const text = lines.slice(top, bot + 1).join('\n');
+  return { text, range: { from, to } };
+}
+
+function getTinymceEditor(): any {
+  const tinymce = (window as any).tinymce;
+  if (!tinymce) return null;
+  const editor = tinymce.activeEditor;
+  if (!editor || editor.isHidden?.() || editor.mode?.get?.() !== 'design') return null;
+  return editor;
+}
+
+function getCurrentBlock(editor: any): HTMLElement | null {
+  const node = editor.selection?.getNode?.();
+  if (!node) return null;
+  const dom = editor.dom;
+  return (dom?.getParent?.(node, dom.isBlock) || node) as HTMLElement;
+}
+
+function getBlockText(el: HTMLElement | null): string {
+  if (!el) return '';
+  return el.innerText || el.textContent || '';
+}
+
+function isListTask(el: HTMLElement): boolean {
+  if (!el) return false;
+  if (el.querySelector?.('input[type="checkbox"]')) return true;
+  const text = getBlockText(el);
+  return /^\s*[-*]\s/.test(text);
+}
+
+function selectElements(editor: any, elements: HTMLElement[]) {
+  if (!elements.length) return;
+  const range = document.createRange();
+  range.setStartBefore(elements[0]);
+  range.setEndAfter(elements[elements.length - 1]);
+  editor.selection.setRng(range);
+  lastContext = {
+    impl: 'tinymce',
+    editor,
+    range: range.cloneRange(),
+    bookmark: editor.selection?.getBookmark?.(2, true) ?? null
+  };
+}
+
+  function post(obj: any) {
+    const wrapped = { __MSC_RES__: obj };
+    if (webviewApi?.postMessage) {
+      try {
+        webviewApi.postMessage(wrapped);
+      } catch {
+        // Fall through to window messaging.
+      }
+    }
+    (window as any).postMessage(wrapped, '*');
+  }
+
+function subscribe() {
+  if (webviewApi?.onMessage) {
+    webviewApi.onMessage((msg: any) => {
+      const data = msg && msg.__MSC_REQ__ ? msg.__MSC_REQ__ : msg;
+      if (!data) return;
+      Bridge.handleMessage(data);
+    });
+  }
+  window.addEventListener('message', (ev) => {
+    const payload = ev.data || {};
+    const data = payload.__MSC_REQ__ || payload;
+    if (!data) return;
+    Bridge.handleMessage(data);
+  });
+}
+
+subscribe();
+
+setTimeout(() => {
+  try {
+    const w = window as any;
+    const flags = {
+      cm6: !!w.cm6?.view,
+      cm5: !!w.cm?.instance,
+      tinymce: !!w.tinymce?.activeEditor,
+      webviewApi: !!webviewApi,
+      location: window.location?.href
+    };
+    post({ event: 'MSC_DEBUG', data: { phase: 'bridge-loaded', flags } });
+  } catch (err) {
+    post({ event: 'MSC_DEBUG', data: { phase: 'bridge-loaded', error: String(err) } });
+  }
+}, 0);
