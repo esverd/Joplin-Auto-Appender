@@ -37,7 +37,24 @@ function toggleTaskIfSingleLine(block, enabled) {
 }
 
 // src/index.ts
-var joplin = globalThis.joplin;
+function resolveJoplinApi() {
+  if (typeof require === "function") {
+    try {
+      const mod = require("api");
+      if (mod?.default) return mod.default;
+      if (mod) return mod;
+    } catch (err) {
+      console.info(
+        '[MSC debug] require("api") unavailable:',
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+  const legacy = globalThis?.joplin;
+  if (legacy) return legacy;
+  throw new Error("Joplin API unavailable");
+}
+var joplin = resolveJoplinApi();
 var ContentScriptType = { CodeMirrorPlugin: 1, HtmlPlugin: 3 };
 var MenuItemLocation = {
   Tools: "tools",
@@ -49,6 +66,37 @@ var HTML_BRIDGE_NAME = `${BRIDGE_NAME}-html`;
 var pendingBridgeRequests = /* @__PURE__ */ new Map();
 var bridgeListenerRegistered = false;
 var bridgeWindowUnsub = null;
+function getWindowApi() {
+  try {
+    return joplin.window ?? null;
+  } catch {
+    return null;
+  }
+}
+async function tryInvokeWindow(name, ...args) {
+  const win = getWindowApi();
+  if (!win) return { ok: false };
+  let method;
+  try {
+    method = win[name];
+  } catch (err) {
+    console.info(`[MSC debug] window.${name} unavailable:`, err?.message || err);
+    return { ok: false };
+  }
+  if (typeof method !== "function") {
+    if (method !== void 0) {
+      console.info(`[MSC debug] window.${name} not callable (type: ${typeof method})`);
+    }
+    return { ok: false };
+  }
+  try {
+    const result = await Reflect.apply(method, win, args);
+    return { ok: true, result };
+  } catch (err) {
+    console.info(`[MSC debug] window.${name} call failed:`, err?.message || err);
+    return { ok: false };
+  }
+}
 async function removeMenuItem(id) {
   const remover = joplin.views.menuItems?.remove;
   if (typeof remover !== "function") return;
@@ -247,8 +295,11 @@ async function ensureBridgeListener() {
       console.info("[MSC debug] contentScripts.onMessage unavailable:", err?.message || err);
     }
   }
-  if (!bridgeWindowUnsub && joplin.window?.onMessage) {
-    bridgeWindowUnsub = await joplin.window.onMessage((raw) => handleBridgeMessage(raw));
+  if (!bridgeWindowUnsub) {
+    const res = await tryInvokeWindow("onMessage", (raw) => handleBridgeMessage(raw));
+    if (res.ok && typeof res.result === "function") {
+      bridgeWindowUnsub = res.result;
+    }
   }
   bridgeListenerRegistered = true;
 }
@@ -276,18 +327,17 @@ async function bridgeRequest(type, payload) {
       }
     }
     if (!sent) {
-      if (typeof joplin.window?.postMessage === "function") {
-        try {
-          await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
-          sent = true;
-        } catch {
-        }
-      }
+      const res = await tryInvokeWindow("postMessage", { __MSC_REQ__: { type, requestId: id, payload } });
+      if (res.ok) sent = true;
     }
     if (!sent) {
       clearTimeout(timeout);
       pendingBridgeRequests.delete(id);
-      reject(new Error("Unable to communicate with editor bridge (no content script messaging support)"));
+      reject(
+        new Error(
+          "Unable to communicate with editor bridge. Please update Joplin to 2.14+ so content script messaging is available."
+        )
+      );
     }
   });
 }

@@ -5,7 +5,27 @@ import {
   type SelectionRange
 } from './utils';
 
-const joplin: any = (globalThis as any).joplin;
+declare const require: undefined | ((id: string) => any);
+
+function resolveJoplinApi(): any {
+  if (typeof require === 'function') {
+    try {
+      const mod = require('api');
+      if (mod?.default) return mod.default;
+      if (mod) return mod;
+    } catch (err: any) {
+      console.info(
+        '[MSC debug] require("api") unavailable:',
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+  const legacy = (globalThis as any)?.joplin;
+  if (legacy) return legacy;
+  throw new Error('Joplin API unavailable');
+}
+
+const joplin: any = resolveJoplinApi();
 const ContentScriptType = { CodeMirrorPlugin: 1, HtmlPlugin: 3 } as const;
 const MenuItemLocation = {
   Tools: 'tools',
@@ -25,6 +45,42 @@ type PendingBridge = {
 const pendingBridgeRequests = new Map<string, PendingBridge>();
 let bridgeListenerRegistered = false;
 let bridgeWindowUnsub: (() => void) | null = null;
+
+function getWindowApi(): any | null {
+  try {
+    return (joplin as any).window ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function tryInvokeWindow(
+  name: 'onMessage' | 'postMessage',
+  ...args: any[]
+): Promise<{ ok: boolean; result?: any }> {
+  const win = getWindowApi();
+  if (!win) return { ok: false };
+  let method: any;
+  try {
+    method = win[name];
+  } catch (err: any) {
+    console.info(`[MSC debug] window.${name} unavailable:`, err?.message || err);
+    return { ok: false };
+  }
+  if (typeof method !== 'function') {
+    if (method !== undefined) {
+      console.info(`[MSC debug] window.${name} not callable (type: ${typeof method})`);
+    }
+    return { ok: false };
+  }
+  try {
+    const result = await Reflect.apply(method, win, args);
+    return { ok: true, result };
+  } catch (err: any) {
+    console.info(`[MSC debug] window.${name} call failed:`, err?.message || err);
+    return { ok: false };
+  }
+}
 
 async function removeMenuItem(id: string): Promise<void> {
   const remover = (joplin.views.menuItems as any)?.remove;
@@ -236,8 +292,11 @@ async function ensureBridgeListener(): Promise<void> {
       console.info('[MSC debug] contentScripts.onMessage unavailable:', err?.message || err);
     }
   }
-  if (!bridgeWindowUnsub && (joplin.window as any)?.onMessage) {
-    bridgeWindowUnsub = await joplin.window.onMessage((raw: any) => handleBridgeMessage(raw));
+  if (!bridgeWindowUnsub) {
+    const res = await tryInvokeWindow('onMessage', (raw: any) => handleBridgeMessage(raw));
+    if (res.ok && typeof res.result === 'function') {
+      bridgeWindowUnsub = res.result;
+    }
   }
   bridgeListenerRegistered = true;
 }
@@ -269,19 +328,17 @@ async function bridgeRequest(type: string, payload?: any): Promise<any> {
       }
     }
     if (!sent) {
-      if (typeof joplin.window?.postMessage === 'function') {
-        try {
-          await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
-          sent = true;
-        } catch {
-          // ignore; we'll reject below if nothing sent
-        }
-      }
+      const res = await tryInvokeWindow('postMessage', { __MSC_REQ__: { type, requestId: id, payload } });
+      if (res.ok) sent = true;
     }
     if (!sent) {
       clearTimeout(timeout);
       pendingBridgeRequests.delete(id);
-      reject(new Error('Unable to communicate with editor bridge (no content script messaging support)'));
+      reject(
+        new Error(
+          'Unable to communicate with editor bridge. Please update Joplin to 2.14+ so content script messaging is available.'
+        )
+      );
     }
   });
 }
