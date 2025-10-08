@@ -97,14 +97,6 @@ async function tryInvokeWindow(name, ...args) {
     return { ok: false };
   }
 }
-async function removeMenuItem(id) {
-  const remover = joplin.views.menuItems?.remove;
-  if (typeof remover !== "function") return;
-  try {
-    await remover.call(joplin.views.menuItems, id);
-  } catch {
-  }
-}
 var SETTINGS = {
   section: "msc",
   targetMode: "msc.targetMode",

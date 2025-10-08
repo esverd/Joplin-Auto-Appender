@@ -82,51 +82,6 @@ async function tryInvokeWindow(
   }
 }
 
-async function removeMenuItem(id: string): Promise<void> {
-  const remover = (joplin.views.menuItems as any)?.remove;
-  if (typeof remover !== 'function') return;
-  try {
-    await remover.call(joplin.views.menuItems, id);
-  } catch {
-    // ignore missing menu
-  }
-}
-
-function getWindowApi(): any | null {
-  try {
-    return (joplin as any).window ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function tryInvokeWindow(
-  name: 'onMessage' | 'postMessage',
-  ...args: any[]
-): Promise<{ ok: boolean; result?: any }> {
-  const win = getWindowApi();
-  if (!win) return { ok: false };
-  let method: any;
-  try {
-    method = win[name];
-  } catch (err: any) {
-    console.info(`[MSC debug] window.${name} unavailable:`, err?.message || err);
-    return { ok: false };
-  }
-  if (typeof method !== 'function') {
-    if (method !== undefined) {
-      console.info(`[MSC debug] window.${name} not callable (type: ${typeof method})`);
-    }
-    return { ok: false };
-  }
-  try {
-    const result = await Reflect.apply(method, win, args);
-    return { ok: true, result };
-  } catch (err: any) {
-    console.info(`[MSC debug] window.${name} call failed:`, err?.message || err);
-    return { ok: false };
-  }
-}
 
 const SETTINGS = {
   section: 'msc',
