@@ -8,6 +8,8 @@ import {
 declare const require: undefined | ((id: string) => any);
 
 function resolveJoplinApi(): any {
+  const legacy = (globalThis as any)?.joplin;
+  if (legacy) return legacy;
   if (typeof require === 'function') {
     try {
       const mod = require('api');
@@ -20,8 +22,6 @@ function resolveJoplinApi(): any {
       );
     }
   }
-  const legacy = (globalThis as any)?.joplin;
-  if (legacy) return legacy;
   throw new Error('Joplin API unavailable');
 }
 
