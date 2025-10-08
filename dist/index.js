@@ -37,9 +37,79 @@ function toggleTaskIfSingleLine(block, enabled) {
 }
 
 // src/index.ts
-var joplin = globalThis.joplin;
-var ContentScriptType = { CodeMirrorPlugin: 1 };
-var MenuItemLocation = { Tools: 1 };
+function resolveJoplinApi() {
+  const globalScope = globalThis;
+  const errors = [];
+  const seen = /* @__PURE__ */ new Set();
+  const addCandidate = (candidate) => {
+    if (typeof candidate === "function" && !seen.has(candidate)) {
+      seen.add(candidate);
+    }
+  };
+  addCandidate(require);
+  addCandidate(__non_webpack_require__);
+  addCandidate(globalScope?.require);
+  const moduleNames = ["api", "@joplin/plugin-api", "joplin-plugin-api"];
+  for (const candidate of seen) {
+    for (const modName of moduleNames) {
+      try {
+        const loaded = candidate(modName);
+        if (!loaded) continue;
+        if (loaded.default) return loaded.default;
+        if (loaded.joplin) return loaded.joplin;
+        return loaded;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`${modName}: ${message}`);
+      }
+    }
+  }
+  if (globalScope?.joplin?.default) return globalScope.joplin.default;
+  if (globalScope?.joplin) return globalScope.joplin;
+  if (errors.length) {
+    console.info("[MSC debug] Unable to resolve Joplin API via require:", errors.join("; "));
+  }
+  throw new Error("Joplin API unavailable");
+}
+var joplin = resolveJoplinApi();
+var ContentScriptType = { CodeMirrorPlugin: 1, HtmlPlugin: 3 };
+var MenuItemLocation = {
+  Tools: "tools",
+  NoteListContextMenu: "noteListContextMenu"
+};
+var BRIDGE_NAME = "msc-editor-bridge";
+var HTML_BRIDGE_NAME = `${BRIDGE_NAME}-html`;
+function getWindowApi() {
+  try {
+    return joplin.window ?? null;
+  } catch {
+    return null;
+  }
+}
+async function tryInvokeWindow(name, ...args) {
+  const win = getWindowApi();
+  if (!win) return { ok: false };
+  let method;
+  try {
+    method = win[name];
+  } catch (err) {
+    console.info(`[MSC debug] window.${name} unavailable:`, err?.message || err);
+    return { ok: false };
+  }
+  if (typeof method !== "function") {
+    if (method !== void 0) {
+      console.info(`[MSC debug] window.${name} not callable (type: ${typeof method})`);
+    }
+    return { ok: false };
+  }
+  try {
+    const result = await Reflect.apply(method, win, args);
+    return { ok: true, result };
+  } catch (err) {
+    console.info(`[MSC debug] window.${name} call failed:`, err?.message || err);
+    return { ok: false };
+  }
+}
 var SETTINGS = {
   section: "msc",
   targetMode: "msc.targetMode",
@@ -123,16 +193,66 @@ async function registerSettings() {
 }
 async function bridgeRequest(type, payload) {
   const id = Math.random().toString(36).slice(2);
-  return new Promise(async (resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Editor bridge timeout")), 3e3);
-    const unsub = await joplin.window.onMessage((msg) => {
+  return new Promise((resolve, reject) => {
+    let unsub = null;
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      if (unsub) {
+        try {
+          unsub();
+        } catch {
+        }
+      }
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Editor bridge timeout"));
+    }, 3e3);
+    const handleMessage = (msg) => {
       if (!msg || !msg.requestId || msg.requestId !== id) return;
       clearTimeout(timeout);
-      unsub();
+      cleanup();
       if (msg.ok) resolve(msg.data);
       else reject(new Error(msg.error || "Bridge error"));
+    };
+    (async () => {
+      const subRes = await tryInvokeWindow("onMessage", handleMessage);
+      if (!subRes.ok) {
+        clearTimeout(timeout);
+        reject(
+          new Error(
+            "Unable to communicate with editor bridge. Click into the note editor and try again."
+          )
+        );
+        return;
+      }
+      if (typeof subRes.result === "function") {
+        unsub = () => {
+          try {
+            subRes.result();
+          } catch {
+          }
+        };
+      }
+      const postRes = await tryInvokeWindow("postMessage", {
+        __MSC_REQ__: { type, requestId: id, payload }
+      });
+      if (!postRes.ok) {
+        clearTimeout(timeout);
+        cleanup();
+        reject(
+          new Error(
+            "Unable to communicate with editor bridge. Please update Joplin to 2.14+ so content script messaging is available."
+          )
+        );
+      }
+    })().catch((err) => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
     });
-    await joplin.window.postMessage({ __MSC_REQ__: { type, requestId: id, payload } });
   });
 }
 async function getSelectionContext() {
@@ -157,6 +277,31 @@ async function getSelectedNote() {
   if (!note?.id) return null;
   const full = await joplin.data.get(["notes", note.id], { fields: ["id", "title", "body", "parent_id", "updated_time"] });
   return full;
+}
+async function getNoteById(noteId) {
+  if (!noteId) return null;
+  try {
+    const full = await joplin.data.get(["notes", noteId], {
+      fields: ["id", "title", "body", "parent_id", "updated_time"]
+    });
+    return full;
+  } catch {
+    return null;
+  }
+}
+async function getNoteFromContext(context) {
+  if (context) {
+    const directId = context.noteId ?? context.itemId;
+    const selected = Array.isArray(context.selectedNoteIds) ? context.selectedNoteIds : [];
+    const candidateId = directId ?? selected[0];
+    const note = await getNoteById(candidateId);
+    if (note) return note;
+  }
+  return getSelectedNote();
+}
+async function storeGlobalTargetNote(note) {
+  await joplin.settings.setValue(SETTINGS.targetMode, "global");
+  await joplin.settings.setValue(SETTINGS.targetNoteId, note.id);
 }
 async function findOrCreateTargetNote(source) {
   const mode = await joplin.settings.value(SETTINGS.targetMode);
@@ -208,11 +353,24 @@ ${current.body || ""}`;
 joplin.plugins.register({
   onStart: async () => {
     await registerSettings();
-    await joplin.contentScripts.register(
-      ContentScriptType.CodeMirrorPlugin,
-      "msc-editor-bridge",
-      "./cm-bridge.js"
-    );
+    try {
+      await joplin.contentScripts.register(
+        ContentScriptType.CodeMirrorPlugin,
+        BRIDGE_NAME,
+        "./cm-bridge.js"
+      );
+    } catch (err) {
+      console.info("[MSC debug] Failed to register CodeMirror bridge script:", err?.message || err);
+    }
+    try {
+      await joplin.contentScripts.register(
+        ContentScriptType.HtmlPlugin,
+        HTML_BRIDGE_NAME,
+        "./cm-bridge.js"
+      );
+    } catch (err) {
+      console.info("[MSC debug] Failed to register HTML bridge script:", err?.message || err);
+    }
     await joplin.commands.register({
       name: "moveSelectionToCompleted",
       label: "Move Selection to Completed",
@@ -223,13 +381,15 @@ joplin.plugins.register({
         let ctx;
         try {
           ctx = await getSelectionContext();
-        } catch {
-          await joplin.views.dialogs.showMessageBox("Move Selection: editor bridge unavailable.");
+        } catch (err) {
+          const msg = err?.message ? `Move Selection: ${err.message}` : "Move Selection: editor bridge unavailable. Click into the note editor and try again.";
+          await joplin.views.dialogs.showMessageBox(msg);
           return;
         }
         let movedText = ctx.text?.trimEnd() ?? "";
         let ranges = ctx.ranges || [];
         const cursorIdx = ctx.cursorIndex ?? 0;
+        let editorImpl = ctx.impl;
         if (!movedText) {
           const fb = await joplin.settings.value(SETTINGS.fallback);
           if (fb === "none") {
@@ -239,6 +399,7 @@ joplin.plugins.register({
           const fbData = fb === "line" ? await getCurrentLineViaBridge() : await getTaskBlockViaBridge();
           movedText = (fbData.text || "").trimEnd();
           ranges = fbData.ranges || [];
+          editorImpl = fbData.impl ?? editorImpl;
         }
         if (!movedText || ranges.length === 0) {
           await joplin.views.dialogs.showMessageBox("Nothing to move.");
@@ -247,7 +408,14 @@ joplin.plugins.register({
         const toggle = await joplin.settings.value(SETTINGS.autoToggleTask);
         movedText = toggleTaskIfSingleLine(movedText, toggle);
         const updatedDocText = await cutRangesViaBridge(ranges);
-        await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+        if (editorImpl === "tinymce") {
+          try {
+            await joplin.commands.execute("editor.save");
+          } catch {
+          }
+        } else {
+          await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+        }
         const target = await findOrCreateTargetNote(source);
         const headerEnabled = await joplin.settings.value(SETTINGS.headerEnabled);
         const tpl = await joplin.settings.value(SETTINGS.headerTemplate);
@@ -261,9 +429,29 @@ joplin.plugins.register({
         }) : null;
         await prependToNote(target, movedText, header);
         await restoreCursorViaBridge(cursorIdx);
-        await joplin.views.dialogs.showMessageBox("Moved to Completed.");
+      }
+    });
+    await joplin.commands.register({
+      name: "mscSetSingleDestinationToCurrent",
+      label: "Set Single Destination to Current Note",
+      iconName: "fas fa-thumbtack",
+      execute: async (context) => {
+        const note = await getNoteFromContext(context);
+        if (!note) {
+          await joplin.views.dialogs.showMessageBox("Move Selection: select a note first.");
+          return;
+        }
+        await storeGlobalTargetNote(note);
+        await joplin.views.dialogs.showMessageBox(
+          `Move Selection: destination set to "${note.title || "Untitled"}".`
+        );
       }
     });
     await joplin.views.menuItems.create("msc-menu", "moveSelectionToCompleted", MenuItemLocation.Tools);
+    await joplin.views.menuItems.create(
+      "msc-context-set-destination",
+      "mscSetSingleDestinationToCurrent",
+      MenuItemLocation.NoteListContextMenu
+    );
   }
 });

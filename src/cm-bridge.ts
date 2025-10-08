@@ -63,18 +63,18 @@ const Bridge = (() => {
     }
   }
 
-  function getCurrentLine(): { text: string; range: Range } {
+  function getCurrentLine(): { text: string; range: Range; impl: string } {
     const info = getDocAndSelection();
     if (info.impl === 'cm6') {
       const line = info.view.state.doc.lineAt(info.cursorIndex);
-      return { text: line.text, range: { from: line.from, to: line.to } };
+      return { text: line.text, range: { from: line.from, to: line.to }, impl: info.impl };
     } else {
       const doc = info.cm.getDoc();
       const cur = doc.getCursor();
       const lineText = doc.getLine(cur.line);
       const from = doc.indexFromPos({ line: cur.line, ch: 0 });
       const to = doc.indexFromPos({ line: cur.line, ch: lineText.length });
-      return { text: lineText, range: { from, to } };
+      return { text: lineText, range: { from, to }, impl: info.impl };
     }
   }
 
@@ -82,7 +82,7 @@ const Bridge = (() => {
     return /^\s*-\s\[( |x|X)\]\s/.test(s);
   }
 
-  function getTaskBlock(): { text: string; range: Range } {
+  function getTaskBlock(): { text: string; range: Range; impl: string } {
     // Expand to contiguous TODO lines around cursor.
     const info = getDocAndSelection();
     const text = info.docText;
@@ -111,7 +111,7 @@ const Bridge = (() => {
       // Fallback to current line if not a task line.
       const lstart = starts[lineIdx];
       const lend = lstart + lines[lineIdx].length;
-      return { text: lines[lineIdx], range: { from: lstart, to: lend } };
+      return { text: lines[lineIdx], range: { from: lstart, to: lend }, impl: info.impl };
     }
 
     let top = lineIdx;
@@ -122,7 +122,7 @@ const Bridge = (() => {
     const from = starts[top];
     const to = starts[bot] + lines[bot].length;
     const block = lines.slice(top, bot + 1).join('\n');
-    return { text: block, range: { from, to } };
+    return { text: block, range: { from, to }, impl: info.impl };
   }
 
   function setCursor(index: number) {
@@ -143,17 +143,27 @@ const Bridge = (() => {
         switch (type) {
           case 'GET_SELECTION_CONTEXT': {
             const ctx = getDocAndSelection();
-            post({ requestId, ok: true, data: { text: ctx.text, ranges: ctx.ranges, cursorIndex: ctx.cursorIndex, docText: ctx.docText } });
+            post({
+              requestId,
+              ok: true,
+              data: {
+                text: ctx.text,
+                ranges: ctx.ranges,
+                cursorIndex: ctx.cursorIndex,
+                docText: ctx.docText,
+                impl: ctx.impl
+              }
+            });
             break;
           }
           case 'GET_CURRENT_LINE': {
-            const { text, range } = getCurrentLine();
-            post({ requestId, ok: true, data: { text, ranges: [range] } });
+            const { text, range, impl } = getCurrentLine();
+            post({ requestId, ok: true, data: { text, ranges: [range], impl } });
             break;
           }
           case 'GET_TASK_BLOCK': {
-            const { text, range } = getTaskBlock();
-            post({ requestId, ok: true, data: { text, ranges: [range] } });
+            const { text, range, impl } = getTaskBlock();
+            post({ requestId, ok: true, data: { text, ranges: [range], impl } });
             break;
           }
           case 'CUT_RANGES': {
