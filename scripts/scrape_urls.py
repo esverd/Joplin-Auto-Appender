@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel URL scraper that aggregates responses in a JSON file."""
+"""Parallel URL scraper that aggregates responses into JSON, text, or PDF output."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ DEFAULT_USER_AGENT = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Download multiple URLs concurrently and write their bodies to a single JSON file."
+            "Download multiple URLs concurrently and save their bodies in JSON, plain text, or PDF form."
         )
     )
     parser.add_argument(
@@ -46,7 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default="scraped_content.json",
-        help="Output JSON file path (default: scraped_content.json)",
+        help="Output file path (default: scraped_content.json)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("json", "txt", "pdf"),
+        default="json",
+        help="Choose output format: json (default), txt, or pdf",
     )
     parser.add_argument(
         "--timeout",
@@ -187,19 +193,86 @@ def compute_workers(args: argparse.Namespace, total_urls: int) -> int:
     return max(1, min(total_urls, cpu_count * 5))
 
 
-def write_output(path: str, results: List[dict]) -> None:
-    output_path = Path(path).expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    for entry in results:
-        entry.pop("index", None)
+def resolve_output_path(requested: str, fmt: str) -> Path:
+    extension_map = {"json": ".json", "txt": ".txt", "pdf": ".pdf"}
+    path = Path(requested).expanduser()
+    if not path.suffix:
+        path = path.with_suffix(extension_map[fmt])
+    return path
 
-    with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(results, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
+
+def format_results_as_text(results: List[dict]) -> str:
+    sections = []
+    separator = "\n" + "-" * 80 + "\n"
+    for entry in results:
+        lines = [f"URL: {entry['url']}"]
+        status = entry.get("status")
+        if status is not None:
+            lines.append(f"Status: {status}")
+        content_type = entry.get("content_type")
+        if content_type:
+            lines.append(f"Content-Type: {content_type}")
+        elapsed = entry.get("elapsed_seconds")
+        if elapsed is not None:
+            lines.append(f"Elapsed seconds: {elapsed}")
+        if "truncated" in entry:
+            lines.append(f"Truncated: {entry['truncated']}")
+        error = entry.get("error")
+        if error:
+            lines.append(f"Error: {error}")
+        else:
+            lines.append("Content:\n" + entry.get("content", ""))
+        sections.append("\n".join(lines).rstrip())
+    text = separator.join(sections)
+    if not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def write_pdf(path: Path, text: str) -> None:
+    try:
+        from fpdf import FPDF
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PDF output requires the 'fpdf' package. Install it with 'pip install fpdf'."
+        ) from exc
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Courier", size=10)
+
+    for line in text.splitlines():
+        pdf.multi_cell(0, 5, line if line else " ")
+
+    pdf.output(str(path))
+
+
+def write_output(path: Path, results: List[dict], fmt: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt == "json":
+        payload = [
+            {k: v for k, v in entry.items() if k != "index"}
+            for entry in results
+        ]
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    elif fmt == "txt":
+        text = format_results_as_text(results)
+        path.write_text(text, encoding="utf-8")
+    elif fmt == "pdf":
+        text = format_results_as_text(results)
+        write_pdf(path, text)
+    else:
+        raise ValueError(f"Unsupported format: {fmt}")
 
 
 def main() -> None:
     args = parse_args()
+    output_path = resolve_output_path(args.output, args.format)
     urls = load_urls(args)
     if not urls:
         print("No URLs provided. Use --url or --urls-file to supply targets.", file=sys.stderr)
@@ -237,10 +310,14 @@ def main() -> None:
 
     # Restore original ordering.
     results.sort(key=lambda entry: entry["index"])
-    write_output(args.output, results)
+    try:
+        write_output(output_path, results, args.format)
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
 
     ok = sum(1 for entry in results if "error" not in entry)
-    print(f"Finished. {ok}/{len(results)} succeeded. Output -> {args.output}")
+    print(f"Finished. {ok}/{len(results)} succeeded. Output -> {output_path}")
 
 
 if __name__ == "__main__":
