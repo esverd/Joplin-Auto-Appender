@@ -38,19 +38,37 @@ function toggleTaskIfSingleLine(block, enabled) {
 
 // src/index.ts
 function resolveJoplinApi() {
-  const legacy = globalThis?.joplin;
-  if (legacy) return legacy;
-  if (typeof require === "function") {
-    try {
-      const mod = require("api");
-      if (mod?.default) return mod.default;
-      if (mod) return mod;
-    } catch (err) {
-      console.info(
-        '[MSC debug] require("api") unavailable:',
-        err instanceof Error ? err.message : err
-      );
+  const globalScope = globalThis;
+  const direct = globalScope?.joplin;
+  if (direct?.default) return direct.default;
+  if (direct) return direct;
+  const errors = [];
+  const seen = /* @__PURE__ */ new Set();
+  const addCandidate = (candidate) => {
+    if (typeof candidate === "function" && !seen.has(candidate)) {
+      seen.add(candidate);
     }
+  };
+  addCandidate(require);
+  addCandidate(__non_webpack_require__);
+  addCandidate(globalScope?.require);
+  const moduleNames = ["api", "@joplin/plugin-api", "joplin-plugin-api"];
+  for (const candidate of seen) {
+    for (const modName of moduleNames) {
+      try {
+        const loaded = candidate(modName);
+        if (!loaded) continue;
+        if (loaded.default) return loaded.default;
+        if (loaded.joplin) return loaded.joplin;
+        return loaded;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`${modName}: ${message}`);
+      }
+    }
+  }
+  if (errors.length) {
+    console.info("[MSC debug] Unable to resolve Joplin API via require:", errors.join("; "));
   }
   throw new Error("Joplin API unavailable");
 }

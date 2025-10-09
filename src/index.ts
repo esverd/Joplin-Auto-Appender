@@ -6,22 +6,46 @@ import {
 } from './utils';
 
 declare const require: undefined | ((id: string) => any);
+declare const __non_webpack_require__: undefined | ((id: string) => any);
 
 function resolveJoplinApi(): any {
-  const legacy = (globalThis as any)?.joplin;
-  if (legacy) return legacy;
-  if (typeof require === 'function') {
-    try {
-      const mod = require('api');
-      if (mod?.default) return mod.default;
-      if (mod) return mod;
-    } catch (err: any) {
-      console.info(
-        '[MSC debug] require("api") unavailable:',
-        err instanceof Error ? err.message : err
-      );
+  const globalScope = globalThis as any;
+  const direct = globalScope?.joplin;
+  if (direct?.default) return direct.default;
+  if (direct) return direct;
+
+  const errors: string[] = [];
+  const seen = new Set<(...args: any[]) => any>();
+  const addCandidate = (candidate: unknown) => {
+    if (typeof candidate === 'function' && !seen.has(candidate)) {
+      seen.add(candidate);
+    }
+  };
+
+  addCandidate(require);
+  addCandidate(__non_webpack_require__);
+  addCandidate(globalScope?.require);
+
+  const moduleNames = ['api', '@joplin/plugin-api', 'joplin-plugin-api'];
+  for (const candidate of seen) {
+    for (const modName of moduleNames) {
+      try {
+        const loaded = candidate(modName);
+        if (!loaded) continue;
+        if (loaded.default) return loaded.default;
+        if (loaded.joplin) return loaded.joplin;
+        return loaded;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`${modName}: ${message}`);
+      }
     }
   }
+
+  if (errors.length) {
+    console.info('[MSC debug] Unable to resolve Joplin API via require:', errors.join('; '));
+  }
+
   throw new Error('Joplin API unavailable');
 }
 
