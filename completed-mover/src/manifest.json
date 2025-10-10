@@ -1,0 +1,23 @@
+{
+  "manifest_version": 1,
+  "id": "com.codex.completedMover",
+  "app_min_version": "3.3",
+  "version": "1.0.0",
+  "name": "Completed Mover",
+  "description": "Move editor selections to configured completed notes with headers and notebook-aware routing.",
+  "author": "Codex Assistant",
+  "homepage_url": "https://github.com/esverd/Joplin-Auto-Appender",
+  "repository_url": "https://github.com/esverd/Joplin-Auto-Appender",
+  "keywords": [
+    "productivity",
+    "joplin-plugin",
+    "tasks"
+  ],
+  "categories": [
+    "productivity",
+    "personal knowledge management"
+  ],
+  "screenshots": [],
+  "icons": {},
+  "promo_tile": {}
+}
