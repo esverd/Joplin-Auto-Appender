@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Parallel URL scraper that aggregates responses into JSON, text, or PDF output."""
+"""Parallel URL scraper that aggregates responses into JSON, text, or PDF output.
+Now supports --content raw|simple|readability.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +9,11 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import time
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, List
 from urllib import error as url_error
@@ -19,6 +24,15 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+# Simple extractor config
+BLOCK_TAGS = {
+    "address","article","aside","blockquote","br","canvas","dd","div","dl","dt",
+    "fieldset","figcaption","figure","footer","form","h1","h2","h3","h4","h5","h6",
+    "header","hr","li","main","nav","noscript","ol","p","pre","section","table","td",
+    "th","tr","ul"
+}
+SKIP_TAGS = {"script", "style", "noscript", "template"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +67,17 @@ def parse_args() -> argparse.Namespace:
         choices=("json", "txt", "pdf"),
         default="json",
         help="Choose output format: json (default), txt, or pdf",
+    )
+    parser.add_argument(
+        "--content",
+        choices=("raw", "simple", "readability"),
+        default="raw",
+        help=(
+            "Choose content mode: "
+            "'raw' saves raw HTML; "
+            "'simple' saves stdlib text extraction; "
+            "'readability' extracts main article text (requires readability-lxml)"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -116,6 +141,124 @@ def read_urls_file(path: str) -> Iterable[str]:
         return list(_iter_lines(handle))
 
 
+# ---------------------------
+# Simple stdlib text extractor
+# ---------------------------
+class _SimpleHTMLTextExtractor(HTMLParser):
+    """Lightweight text extractor using only stdlib.
+
+    - Skips <script>/<style>/<noscript>/<template>
+    - Inserts newlines at block-level boundaries (incl. <br>)
+    - Collapses whitespace while preserving paragraph breaks
+    """
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self._chunks: List[str] = []
+        self._skip_stack: List[str] = []
+        self._last_was_block_break = True  # avoid leading newlines
+        self._pending_space = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in SKIP_TAGS:
+            self._skip_stack.append(tag)
+            return
+        if self._skip_stack:
+            return
+        if tag == "br" or tag in BLOCK_TAGS:
+            self._emit_block_break()
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self._skip_stack:
+            if self._skip_stack and self._skip_stack[-1] == tag:
+                self._skip_stack.pop()
+            return
+        if tag in BLOCK_TAGS:
+            self._emit_block_break()
+
+    def handle_data(self, data):
+        if self._skip_stack:
+            return
+        text = unescape(data)
+        text = re.sub(r"\s+", " ", text)
+        if not text.strip():
+            self._pending_space = True
+            return
+        if self._pending_space and not self._last_was_block_break:
+            self._chunks.append(" ")
+        self._chunks.append(text.strip())
+        self._pending_space = False
+        self._last_was_block_break = False
+
+    def _emit_block_break(self):
+        if self._chunks and not self._last_was_block_break:
+            self._chunks.append("\n")
+        self._pending_space = False
+        self._last_was_block_break = True
+
+    def get_text(self) -> str:
+        text = "".join(self._chunks)
+        text = re.sub(r"\n{3,}", "\n\n", text)  # collapse 3+ blank lines
+        return text.strip()
+
+
+def extract_visible_text(html: str, content_type: str) -> str:
+    """Extract readable text from HTML. For non-HTML, returns the original input."""
+    if not html:
+        return html
+    ct = (content_type or "").lower()
+    if "html" not in ct:
+        return html
+    parser = _SimpleHTMLTextExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+        return parser.get_text()
+    except Exception:
+        # Fallback: very naive strip
+        no_tags = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
+        no_tags = re.sub(r"(?is)<br\s*/?>", "\n", no_tags)
+        no_tags = re.sub(r"(?s)<.*?>", " ", no_tags)
+        no_tags = unescape(no_tags)
+        no_tags = re.sub(r"[ \t\r\f\v]+", " ", no_tags)
+        no_tags = re.sub(r"\n{3,}", "\n\n", no_tags)
+        return no_tags.strip()
+
+
+# ---------------------------
+# Readability extractor (optional)
+# ---------------------------
+def extract_with_readability(html: str, content_type: str) -> str:
+    """Use Readability to isolate the main article, then convert to text.
+
+    Requires `readability-lxml`. If unavailable or the page is not HTML,
+    falls back to the simple extractor.
+    """
+    if "html" not in (content_type or "").lower():
+        return html
+    try:
+        from readability import Document  # type: ignore
+    except ModuleNotFoundError:
+        # Caller will likely indicate fallback; still return something useful.
+        return extract_visible_text(html, content_type)
+
+    try:
+        doc = Document(html)
+        article_html = doc.summary(html_partial=True)  # distilled HTML fragment
+        # Convert distilled HTML to text using the simple extractor
+        text = extract_visible_text(article_html, "text/html")
+        title = (doc.title() or "").strip()
+        if title:
+            # Avoid duplicating title if it already leads the text
+            first_line = next((ln for ln in text.splitlines() if ln.strip()), "")
+            if title != first_line:
+                text = f"{title}\n\n{text}" if text else title
+        return text.strip()
+    except Exception:
+        return extract_visible_text(html, content_type)
+
+
 def fetch_url(
     index: int,
     url: str,
@@ -123,6 +266,7 @@ def fetch_url(
     timeout: float,
     max_bytes: int,
     user_agent: str,
+    content_mode: str,  # "raw" | "simple" | "readability"
 ) -> dict:
     started = time.perf_counter()
     request = url_request.Request(url, headers={"User-Agent": user_agent})
@@ -143,16 +287,46 @@ def fetch_url(
             except LookupError:
                 body = raw.decode("utf-8", errors="replace")
 
+            # Choose content
+            requested_mode = content_mode
+            effective_mode = requested_mode
+            note = None
+
+            if requested_mode == "raw":
+                content = body
+            elif requested_mode == "simple":
+                content = extract_visible_text(body, content_type)
+            elif requested_mode == "readability":
+                before = extract_with_readability(body, content_type)
+                # If readability-lxml isn't installed, our function falls back to simple.
+                # Detect that by comparing outputs only loosely is hard; instead,
+                # we attempt an import here to set a precise note.
+                try:
+                    import importlib
+                    importlib.import_module("readability")
+                except ModuleNotFoundError:
+                    effective_mode = "simple"
+                    note = "readability-lxml not installed; fell back to 'simple'"
+                content = before
+            else:
+                content = body  # safety fallback
+                effective_mode = "raw"
+
             elapsed = time.perf_counter() - started
-            return {
+            entry = {
                 "index": index,
                 "url": url,
                 "status": status_code,
                 "content_type": content_type,
                 "elapsed_seconds": round(elapsed, 3),
                 "truncated": truncated,
-                "content": body,
+                "content": content,
+                "content_mode": effective_mode,
+                "content_mode_requested": requested_mode,
             }
+            if note:
+                entry["note"] = note
+            return entry
 
     except url_error.HTTPError as exc:
         elapsed = time.perf_counter() - started
@@ -172,7 +346,7 @@ def fetch_url(
             "elapsed_seconds": round(elapsed, 3),
             "error": f"URLError: {exc.reason}",
         }
-    except Exception as exc:  # noqa: BLE001 - want to capture unexpected issues
+    except Exception as exc:  # noqa: BLE001 - defensive catch
         elapsed = time.perf_counter() - started
         return {
             "index": index,
@@ -185,10 +359,8 @@ def fetch_url(
 def compute_workers(args: argparse.Namespace, total_urls: int) -> int:
     if total_urls <= 1:
         return 1
-
     if args.max_workers:
         return max(1, args.max_workers)
-
     cpu_count = os.cpu_count() or 4
     return max(1, min(total_urls, cpu_count * 5))
 
@@ -217,6 +389,16 @@ def format_results_as_text(results: List[dict]) -> str:
             lines.append(f"Elapsed seconds: {elapsed}")
         if "truncated" in entry:
             lines.append(f"Truncated: {entry['truncated']}")
+        cmode = entry.get("content_mode")
+        reqmode = entry.get("content_mode_requested")
+        if cmode or reqmode:
+            if reqmode and reqmode != cmode:
+                lines.append(f"Content-Mode: {cmode} (requested: {reqmode})")
+            else:
+                lines.append(f"Content-Mode: {cmode or reqmode}")
+        note = entry.get("note")
+        if note:
+            lines.append(f"Note: {note}")
         error = entry.get("error")
         if error:
             lines.append(f"Error: {error}")
@@ -291,6 +473,7 @@ def main() -> None:
                 timeout=args.timeout,
                 max_bytes=args.max_bytes,
                 user_agent=args.user_agent,
+                content_mode=args.content,
             ): index
             for index, url in enumerate(urls)
         }
@@ -298,7 +481,7 @@ def main() -> None:
         for future in concurrent.futures.as_completed(future_to_index):
             try:
                 results.append(future.result())
-            except Exception as exc:  # noqa: BLE001 - defensive catch
+            except Exception as exc:  # noqa: BLE001
                 index = future_to_index[future]
                 results.append(
                     {
