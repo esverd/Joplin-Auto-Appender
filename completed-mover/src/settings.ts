@@ -27,7 +27,7 @@ export const DEFAULT_FALLBACK: FallbackBehavior = 'line';
 export async function registerSettings(): Promise<void> {
   await joplin.settings.registerSection(SETTINGS_SECTION, {
     label: 'Completed Mover',
-    description: 'Configure where moved snippets go and how they are formatted.',
+    description: 'Configure destinations, headers, and behaviour. Tip: assign a hotkey via Tools -> Options -> Keyboard Shortcuts (search for "Move selection to completed note").',
     iconName: 'fas fa-check-double'
   });
 

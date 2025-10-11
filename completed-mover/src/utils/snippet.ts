@@ -43,7 +43,7 @@ function expandTaskBlock(body: string, initialStart: number, initialEnd: number)
   return { start, end };
 }
 
-function sanitizeSnippet(snippet: string): string {
+export function normalizeSnippetText(snippet: string): string {
   return snippet.replace(/\r/g, '').replace(/\s+$/g, (match) => (match.includes('\n') ? '\n' : ''));
 }
 
@@ -67,7 +67,7 @@ export function extractSnippet(body: string, selection: SelectionPayload, behavi
     const snippet = body.slice(start, end);
     if (!snippet.trim().length) return null;
     return {
-      snippet: sanitizeSnippet(snippet),
+      snippet: normalizeSnippetText(snippet),
       removalStart: start,
       removalEnd: end,
       cursorAfterRemoval: start,
@@ -95,7 +95,7 @@ export function extractSnippet(body: string, selection: SelectionPayload, behavi
   if (!snippet.trim().length) return null;
 
   return {
-    snippet: sanitizeSnippet(snippet),
+    snippet: normalizeSnippetText(snippet),
     removalStart: range.start,
     removalEnd: range.end,
     cursorAfterRemoval: range.start,
@@ -122,7 +122,7 @@ export function composeInsertionBlock(header: string | null, snippet: string, in
     parts.push(header.trimEnd());
     if (insertBlankLine) parts.push('');
   }
-  parts.push(snippet.replace(/\r/g, '').trimEnd());
+  parts.push(normalizeSnippetText(snippet).trimEnd());
   return ensureTrailingNewlines(parts.join('\n'), 1);
 }
 
@@ -132,4 +132,31 @@ export function prependToBody(block: string, existingBody: string): string {
   if (!existingBody) return normalizedBlock;
   const strippedExisting = existingBody.replace(/^[\n]+/, '');
   return normalizedBlock + strippedExisting;
+}
+
+export function diffRemovedSegment(original: string, updated: string): { snippet: string; newBody: string } | null {
+  if (original === updated) return null;
+
+  let start = 0;
+  const originalLength = original.length;
+  const updatedLength = updated.length;
+
+  while (start < originalLength && start < updatedLength && original[start] === updated[start]) {
+    start++;
+  }
+
+  let originalEnd = originalLength - 1;
+  let updatedEnd = updatedLength - 1;
+
+  while (originalEnd >= start && updatedEnd >= start && original[originalEnd] === updated[updatedEnd]) {
+    originalEnd--;
+    updatedEnd--;
+  }
+
+  const snippet = original.slice(start, originalEnd + 1);
+  const newBody = original.slice(0, start) + original.slice(originalEnd + 1);
+
+  if (!snippet.length) return null;
+
+  return { snippet, newBody };
 }

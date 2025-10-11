@@ -21,9 +21,10 @@ import {
   shouldMarkTasksComplete,
   shouldShowNotifications,
   SettingKeys,
+  FallbackBehavior,
 } from './settings';
-import { SelectionPayload, ApplyChangesPayload } from './types';
-import { extractSnippet, toggleTasksToComplete, composeInsertionBlock, prependToBody } from './utils/snippet';
+import { SelectionPayload, ApplyChangesPayload, ExtractionResult } from './types';
+import { extractSnippet, toggleTasksToComplete, composeInsertionBlock, prependToBody, normalizeSnippetText, diffRemovedSegment } from './utils/snippet';
 import { renderHeader } from './utils/header';
 
 const CM_SCRIPT_ID = 'completedMover.cmScript';
@@ -34,6 +35,9 @@ const COMMAND_SET_GLOBAL_TARGET = 'completedMover.setGlobalTarget';
 
 const DEFAULT_CREATED_NOTE_TITLE = 'Completed Items';
 const SELECTION_TIMEOUT = 4000;
+const DUPLICATE_TOAST_INTERVAL = 3500;
+const RICH_TEXT_POLL_INTERVAL = 50;
+const RICH_TEXT_POLL_ATTEMPTS = 20;
 
 interface NoteEntity {
   id: string;
@@ -52,6 +56,8 @@ type SelectionResolver = (selection: SelectionPayload) => void;
 
 const pendingSelections = new Map<number, SelectionResolver>();
 let selectionCounter = 0;
+let lastToastMessage = '';
+let lastToastTimestamp = 0;
 
 joplin.plugins.register({
   onStart: async () => {
@@ -128,28 +134,56 @@ async function registerMenus(): Promise<void> {
 }
 
 async function moveSelectionToCompleted(): Promise<void> {
-  const note = await joplin.workspace.selectedNote();
-  if (!note) {
+  const noteMeta = await joplin.workspace.selectedNote();
+  if (!noteMeta) {
     await notify('No note is currently selected.');
     return;
   }
 
-  const selection = await requestSelection();
-  const fallback = await getFallbackBehavior();
-  const source = await getNoteEntity(note.id);
+  let source = await getNoteEntity(noteMeta.id);
   if (!source) {
     await notify('Unable to load current note content.');
     return;
   }
 
-  const extraction = extractSnippet(source.body ?? '', selection, fallback);
-  if (!extraction) {
-    await notify('Nothing to move – select text or adjust fallback behavior.');
-    return;
+  const fallback = await getFallbackBehavior();
+
+  let snippet: string;
+  let newSourceBody: string;
+  let fallbackApplied: 'selection' | 'line' | 'task';
+  let toggledCount = 0;
+  let requiresEditorPatch = false;
+  let extraction: ExtractionResult | null = null;
+
+  let selection: SelectionPayload | null = null;
+  try {
+    selection = await requestSelection();
+  } catch (error) {
+    selection = null;
   }
 
-  let snippet = extraction.snippet;
-  let toggledCount = 0;
+  if (selection) {
+    extraction = extractSnippet(source.body ?? '', selection, fallback);
+    if (!extraction) {
+      await notify('Nothing to move – select text or adjust fallback behavior.');
+      return;
+    }
+
+    snippet = extraction.snippet;
+    newSourceBody = extraction.newBody;
+    fallbackApplied = extraction.fallbackApplied;
+    requiresEditorPatch = true;
+  } else {
+    const richResult = await extractFromRichText(source, fallback);
+    if (!richResult) return;
+
+    snippet = richResult.snippet;
+    newSourceBody = richResult.newBody;
+    fallbackApplied = 'selection';
+    requiresEditorPatch = false;
+    source = richResult.updatedSource;
+  }
+
   if (await shouldMarkTasksComplete()) {
     const toggled = toggleTasksToComplete(snippet);
     snippet = toggled.text;
@@ -166,27 +200,31 @@ async function moveSelectionToCompleted(): Promise<void> {
   const block = composeInsertionBlock(header, snippet, await insertBlankLineAfterHeader());
   const newDestBody = prependToBody(block, destination.body ?? '');
 
-  await persistNoteBody(source, extraction.newBody);
+  await persistNoteBody(source, newSourceBody);
   await persistNoteBody(destination, newDestBody);
 
-  await applyEditorChanges({
-    changes: [
-      {
-        from: extraction.removalStart,
-        to: extraction.removalEnd,
-        text: '',
+  if (requiresEditorPatch && extraction) {
+    await applyEditorChanges({
+      changes: [
+        {
+          from: extraction.removalStart,
+          to: extraction.removalEnd,
+          text: '',
+        },
+      ],
+      cursor: {
+        anchor: extraction.cursorAfterRemoval,
+        head: extraction.cursorAfterRemoval,
       },
-    ],
-    cursor: {
-      anchor: extraction.cursorAfterRemoval,
-      head: extraction.cursorAfterRemoval,
-    },
-    scrollIntoView: true,
-  });
+      scrollIntoView: true,
+    });
+  } else if (!requiresEditorPatch) {
+    await joplin.commands.execute('editor.execCommand', { name: 'editor.focus' }).catch(() => {});
+  }
 
   if (await shouldShowNotifications()) {
     const toggledText = toggledCount > 0 ? ` – marked ${toggledCount} task${toggledCount === 1 ? '' : 's'} complete` : '';
-    await showToast(`Moved ${extraction.fallbackApplied} snippet to "${destination.title}"${toggledText}.`);
+    await showToast(`Moved ${fallbackApplied} snippet to "${destination.title}"${toggledText}.`);
   }
 }
 
@@ -392,12 +430,62 @@ async function buildHeader(sourceNote: NoteEntity, notebookId?: string | null): 
   }).trim();
 }
 
+interface RichTextExtractionResult {
+  snippet: string;
+  newBody: string;
+  updatedSource: NoteEntity;
+}
+
+async function extractFromRichText(source: NoteEntity, fallback: FallbackBehavior): Promise<RichTextExtractionResult | null> {
+  const originalBody = source.body ?? '';
+
+  const selected = await joplin.commands.execute('selectedText').catch(() => '');
+  const rawSnippet = typeof selected === 'string' ? selected : '';
+  if (!rawSnippet.trim().length) {
+    if (fallback !== 'selection') {
+      await notify('Line or task fallback is only available in the Markdown editor. Select the text to move or switch to the Markdown editor.');
+    } else {
+      await notify('Select the text you want to move when using the rich text editor.');
+    }
+    return null;
+  }
+
+  await joplin.commands.execute('replaceSelection', '');
+  const updated = await waitForUpdatedBody(source.id, originalBody);
+  if (!updated) {
+    await notify('Joplin did not finish updating the note. Please try again.');
+    return null;
+  }
+
+  const diff = diffRemovedSegment(originalBody, updated.body ?? '');
+  if (!diff || !diff.snippet.trim()) {
+    await notify('Select the text you want to move when using the rich text editor.');
+    return null;
+  }
+
+  return {
+    snippet: diff.snippet,
+    newBody: diff.newBody,
+    updatedSource: updated,
+  };
+}
+
 async function showToast(message: string, type: ToastType = ToastType.Info): Promise<void> {
-  await joplin.views.dialogs.showToast({
-    message,
-    type,
-    duration: 4000,
-  });
+  const now = Date.now();
+  if (message === lastToastMessage && now - lastToastTimestamp < DUPLICATE_TOAST_INTERVAL) return;
+
+  lastToastMessage = message;
+  lastToastTimestamp = now;
+
+  try {
+    await joplin.views.dialogs.showToast({
+      message,
+      type,
+      duration: 4000,
+    });
+  } catch (error) {
+    console.warn('Completed Mover: unable to display toast notification.', error);
+  }
 }
 
 async function notify(message: string): Promise<void> {
@@ -420,4 +508,19 @@ async function getActiveNote(): Promise<NoteEntity | null> {
   const note = await joplin.workspace.selectedNote();
   if (!note) return null;
   return getNoteEntity(note.id);
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForUpdatedBody(noteId: string, previousBody: string): Promise<NoteEntity | null> {
+  for (let attempt = 0; attempt < RICH_TEXT_POLL_ATTEMPTS; attempt++) {
+    if (attempt > 0) await delay(RICH_TEXT_POLL_INTERVAL);
+    const note = await getNoteEntity(noteId);
+    if (!note) return null;
+    if ((note.body ?? '') !== previousBody) return note;
+    if (attempt === RICH_TEXT_POLL_ATTEMPTS - 1) return note;
+  }
+  return getNoteEntity(noteId);
 }
