@@ -34,7 +34,7 @@ const COMMAND_CLEAR_NOTEBOOK_TARGET = 'completedMover.clearNotebookTarget';
 const COMMAND_SET_GLOBAL_TARGET = 'completedMover.setGlobalTarget';
 
 const DEFAULT_CREATED_NOTE_TITLE = 'Completed Items';
-const SELECTION_TIMEOUT = 800;
+const SELECTION_TIMEOUT = 300;
 const DUPLICATE_TOAST_INTERVAL = 3500;
 const RICH_TEXT_POLL_INTERVAL = 150;
 const RICH_TEXT_POLL_ATTEMPTS = 100;
@@ -166,27 +166,23 @@ async function moveSelectionToCompleted(): Promise<void> {
   let extraction: ExtractionResult | null = null;
 
   let selection: SelectionPayload | null = null;
-  if (!assumeRichTextEditor) {
-    try {
-      selection = await requestSelection();
-      if (selection) {
-        logDebug('CodeMirror selection received', {
-          from: selection.from,
-          to: selection.to,
-          empty: selection.isEmpty,
-          docLength: selection.docLength,
-        });
-        assumeRichTextEditor = false;
-      } else {
-        logDebug('CodeMirror selection returned null');
-      }
-    } catch (error) {
-      selection = null;
-      assumeRichTextEditor = true;
-      logDebug('Request selection threw; falling back to rich text', error);
+  try {
+    selection = await requestSelection();
+    if (selection) {
+      logDebug('CodeMirror selection received', {
+        from: selection.from,
+        to: selection.to,
+        empty: selection.isEmpty,
+        docLength: selection.docLength,
+      });
+      assumeRichTextEditor = false;
+    } else {
+      logDebug('CodeMirror selection returned null');
     }
-  } else {
-    logDebug('Skipping CodeMirror selection request (assuming rich text editor)');
+  } catch (error) {
+    selection = null;
+    assumeRichTextEditor = true;
+    logDebug('Request selection threw; falling back to rich text', error);
   }
 
   if (selection) {
