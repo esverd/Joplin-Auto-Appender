@@ -36,8 +36,8 @@ const COMMAND_SET_GLOBAL_TARGET = 'completedMover.setGlobalTarget';
 const DEFAULT_CREATED_NOTE_TITLE = 'Completed Items';
 const SELECTION_TIMEOUT = 4000;
 const DUPLICATE_TOAST_INTERVAL = 3500;
-const RICH_TEXT_POLL_INTERVAL = 50;
-const RICH_TEXT_POLL_ATTEMPTS = 20;
+const RICH_TEXT_POLL_INTERVAL = 150;
+const RICH_TEXT_POLL_ATTEMPTS = 100;
 
 interface NoteEntity {
   id: string;
@@ -58,6 +58,15 @@ const pendingSelections = new Map<number, SelectionResolver>();
 let selectionCounter = 0;
 let lastToastMessage = '';
 let lastToastTimestamp = 0;
+
+const LOG_PREFIX = '[CompletedMover]';
+function logDebug(...args: any[]): void {
+  try {
+    console.info(LOG_PREFIX, ...args);
+  } catch {
+    // ignore logging failures
+  }
+}
 
 joplin.plugins.register({
   onStart: async () => {
@@ -158,8 +167,19 @@ async function moveSelectionToCompleted(): Promise<void> {
   let selection: SelectionPayload | null = null;
   try {
     selection = await requestSelection();
+    if (selection) {
+      logDebug('CodeMirror selection received', {
+        from: selection.from,
+        to: selection.to,
+        empty: selection.isEmpty,
+        docLength: selection.docLength,
+      });
+    } else {
+      logDebug('CodeMirror selection returned null');
+    }
   } catch (error) {
     selection = null;
+    logDebug('Request selection threw; falling back to rich text', error);
   }
 
   if (selection) {
@@ -439,29 +459,37 @@ interface RichTextExtractionResult {
 async function extractFromRichText(source: NoteEntity, fallback: FallbackBehavior): Promise<RichTextExtractionResult | null> {
   const originalBody = source.body ?? '';
 
-  const selected = await joplin.commands.execute('selectedText').catch(() => '');
-  const rawSnippet = typeof selected === 'string' ? selected : '';
-  if (!rawSnippet.trim().length) {
-    if (fallback !== 'selection') {
-      await notify('Line or task fallback is only available in the Markdown editor. Select the text to move or switch to the Markdown editor.');
-    } else {
-      await notify('Select the text you want to move when using the rich text editor.');
-    }
+  await joplin.commands.execute('editor.execCommand', { name: 'editor.focus' }).catch(() => {});
+  logDebug('Rich text path engaged', { fallback, originalLength: originalBody.length });
+
+  const replaced = await replaceEditorSelection('', true);
+  if (!replaced) {
+    await notify('Unable to modify the rich text editor selection. Please try again.');
+    logDebug('Failed to clear selection via editor commands');
     return null;
   }
-
-  await joplin.commands.execute('replaceSelection', '');
+  logDebug('Selection cleared; waiting for note body update');
   const updated = await waitForUpdatedBody(source.id, originalBody);
   if (!updated) {
     await notify('Joplin did not finish updating the note. Please try again.');
+    logDebug('Timed out waiting for note body update');
     return null;
   }
 
   const diff = diffRemovedSegment(originalBody, updated.body ?? '');
   if (!diff || !diff.snippet.trim()) {
-    await notify('Select the text you want to move when using the rich text editor.');
+    if (fallback !== 'selection') {
+      await notify('Line or task fallback is only available in the Markdown editor. Select the text to move or switch to the Markdown editor.');
+    } else {
+      await notify('Select the text you want to move when using the rich text editor.');
+    }
+    logDebug('Diff was empty', {
+      updatedLength: (updated.body ?? '').length,
+    });
     return null;
   }
+
+  logDebug('Diff succeeded', { snippetLength: diff.snippet.length });
 
   return {
     snippet: diff.snippet,
@@ -519,8 +547,51 @@ async function waitForUpdatedBody(noteId: string, previousBody: string): Promise
     if (attempt > 0) await delay(RICH_TEXT_POLL_INTERVAL);
     const note = await getNoteEntity(noteId);
     if (!note) return null;
-    if ((note.body ?? '') !== previousBody) return note;
-    if (attempt === RICH_TEXT_POLL_ATTEMPTS - 1) return note;
+    const changed = (note.body ?? '') !== previousBody;
+    if (changed) {
+      logDebug('Note body updated', { attempt });
+      return note;
+    }
+    if (attempt % 10 === 0) {
+      logDebug('Awaiting note body change', { attempt });
+    }
   }
-  return getNoteEntity(noteId);
+  return null;
+}
+
+async function replaceEditorSelection(replacement: string, preferRichText: boolean): Promise<boolean> {
+  const codeMirrorAttempts: Array<{ type: 'exec' | 'legacy'; payload: any; name: string }> = [
+    { type: 'exec', payload: { name: 'replaceSelection', args: [replacement] }, name: 'replaceSelection' },
+    { type: 'legacy', payload: replacement, name: 'replaceSelection (legacy)' },
+  ];
+
+  const tinyMceAttempts: Array<{ type: 'exec'; payload: any; name: string }> = [
+    { type: 'exec', payload: { name: 'mceReplaceContent', value: replacement, ui: false, args: [] }, name: 'mceReplaceContent' },
+    { type: 'exec', payload: { name: 'mceInsertContent', value: replacement, ui: false, args: [] }, name: 'mceInsertContent' },
+  ];
+
+  const attempts = preferRichText
+    ? [...tinyMceAttempts, ...codeMirrorAttempts]
+    : [...codeMirrorAttempts, ...tinyMceAttempts];
+
+  for (const attempt of attempts) {
+    try {
+      if (attempt.type === 'legacy') {
+        logDebug('Attempting legacy replaceSelection');
+        await joplin.commands.execute('replaceSelection', attempt.payload);
+      } else {
+        logDebug('Attempting editor.execCommand', attempt.name);
+        await joplin.commands.execute('editor.execCommand', attempt.payload);
+      }
+      logDebug('Selection replacement succeeded via', attempt.name);
+      return true;
+    } catch (error) {
+      console.warn(`Completed Mover: selection replacement command ${attempt.name} failed.`, error);
+      logDebug('Selection replacement attempt failed', attempt.name, error);
+    }
+  }
+
+  console.warn('Completed Mover: unable to replace selection.', new Error('All replacement strategies failed.'));
+  logDebug('All selection replacement strategies failed');
+  return false;
 }
