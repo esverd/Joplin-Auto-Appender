@@ -40,6 +40,10 @@ Advanced options expose the stored global note ID (useful if you prefer editing 
 3. The snippet is removed from the source note, a header is added, and everything is prepended to the completed note.
 4. Focus returns to the editor with the cursor positioned where the snippet was cut.
 
+## Rich Text Heads-up
+- The plugin prefers the Markdown editor for best fidelity. When you run it from the rich text/TinyMCE editor we transparently copy content via HTML commands, and most selections work fine.
+- Complex layouts such as tables or other rich widgets sometimes fail to transfer cleanly in rich text because TinyMCE doesn’t always report the change back to the note body. When that happens, switch to the Markdown editor, make the move there, and the content will be captured correctly.
+
 ## Development
 ```bash
 cd completed-mover
@@ -50,5 +54,4 @@ The compiled plugin lives in `publish/com.completedMover.jpl`. Add the `complete
 
 ## Requirements
 - Joplin Desktop 3.3 or later (CodeMirror 6 editor).
-
 
