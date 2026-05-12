@@ -33,57 +33,61 @@ function toggleTaskIfSingleLine(block, enabled) {
   if (!m) return block;
   const checked = m[1].toLowerCase() === "x";
   if (checked) return block;
-  return lines[0].replace(/^\s*-\s\[\s\]/, "- [x]");
+  return lines[0].replace(/^(\s*-\s)\[\s\]/, "$1[x]");
+}
+function insertBlockIntoBody(currentBody, block, header, placement) {
+  const entry = `${header ? header + "\n" : ""}${block}`.trimEnd();
+  const body = currentBody || "";
+  if (!body.trim()) return `${entry}
+`;
+  if (placement === "append") return `${body.replace(/\s*$/, "")}
+
+${entry}
+`;
+  return `${entry}
+
+${body}`;
+}
+function isCurrentOperation(operationId, latestOperationId) {
+  return operationId === latestOperationId;
+}
+function createSerialQueue() {
+  let chain = Promise.resolve();
+  return async function enqueue(task) {
+    const run = chain.then(task, task);
+    chain = run.then(
+      () => void 0,
+      () => void 0
+    );
+    return run;
+  };
 }
 
 // src/index.ts
-function resolveJoplinApi() {
-  const globalScope = globalThis;
-  const direct = globalScope?.joplin;
-  if (direct?.default) return direct.default;
-  if (direct) return direct;
-  const errors = [];
-  const seen = /* @__PURE__ */ new Set();
-  const addCandidate = (candidate) => {
-    if (typeof candidate === "function" && !seen.has(candidate)) {
-      seen.add(candidate);
-    }
-  };
-  addCandidate(require);
-  addCandidate(__non_webpack_require__);
-  addCandidate(globalScope?.require);
-  const moduleNames = ["api", "@joplin/plugin-api", "joplin-plugin-api"];
-  for (const candidate of seen) {
-    for (const modName of moduleNames) {
-      try {
-        const loaded = candidate(modName);
-        if (!loaded) continue;
-        if (loaded.default) return loaded.default;
-        if (loaded.joplin) return loaded.joplin;
-        return loaded;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        errors.push(`${modName}: ${message}`);
-      }
-    }
-  }
-  if (errors.length) {
-    console.info("[MSC debug] Unable to resolve Joplin API via require:", errors.join("; "));
-  }
-  throw new Error("Joplin API unavailable");
-}
-var joplin = resolveJoplinApi();
-var ContentScriptType = { CodeMirrorPlugin: 1, HtmlPlugin: 3 };
+var ContentScriptType = { CodeMirrorPlugin: "codeMirrorPlugin" };
 var MenuItemLocation = {
   Tools: "tools",
   NoteListContextMenu: "noteListContextMenu"
 };
+var ToolbarButtonLocation = {
+  NoteToolbar: "noteToolbar"
+};
+var ToastType = {
+  Info: "info",
+  Success: "success",
+  Error: "error"
+};
 var SettingItemType = { Int: 1, String: 2, Bool: 3, Array: 4, Object: 5, Button: 6 };
-var BRIDGE_NAME = "msc-editor-bridge";
-var HTML_BRIDGE_NAME = `${BRIDGE_NAME}-html`;
+var APP_NAME = "Auto Appender";
+var DEFAULT_SHORTCUT = "Ctrl+Alt+F";
+var BRIDGE_NAME = "auto-appender-editor-bridge";
 var pendingBridgeRequests = /* @__PURE__ */ new Map();
 var bridgeListenerRegistered = false;
 var bridgeWindowUnsub = null;
+var latestMoveOperationId = 0;
+var setupDialogHandle = null;
+var sourceWriteQueues = /* @__PURE__ */ new Map();
+var targetWriteQueues = /* @__PURE__ */ new Map();
 function getWindowApi() {
   try {
     return joplin.window ?? null;
@@ -98,12 +102,12 @@ async function tryInvokeWindow(name, ...args) {
   try {
     method = win[name];
   } catch (err) {
-    console.info(`[MSC debug] window.${name} unavailable:`, err?.message || err);
+    console.info(`[Auto Appender debug] window.${name} unavailable:`, err?.message || err);
     return { ok: false };
   }
   if (typeof method !== "function") {
     if (method !== void 0) {
-      console.info(`[MSC debug] window.${name} not callable (type: ${typeof method})`);
+      console.info(`[Auto Appender debug] window.${name} not callable (type: ${typeof method})`);
     }
     return { ok: false };
   }
@@ -111,7 +115,7 @@ async function tryInvokeWindow(name, ...args) {
     const result = await Reflect.apply(method, win, args);
     return { ok: true, result };
   } catch (err) {
-    console.info(`[MSC debug] window.${name} call failed:`, err?.message || err);
+    console.info(`[Auto Appender debug] window.${name} call failed:`, err?.message || err);
     return { ok: false };
   }
 }
@@ -125,19 +129,20 @@ var SETTINGS = {
   globalNotebookPath: "msc.globalNotebookPath",
   headerEnabled: "msc.headerEnabled",
   headerTemplate: "msc.headerTemplate",
-  // "### {{date:YYYY-MM-DD}} — from \"{{title}}\""
+  // "### {{date:YYYY-MM-DD}} - from \"{{title}}\""
   fallback: "msc.fallback",
   // 'line' | 'taskBlock' | 'none'
   autoToggleTask: "msc.autoToggleTask",
   completedNoteName: "msc.completedNoteName",
   dateLocale: "msc.dateLocale",
-  commandShortcut: "msc.commandShortcut",
+  shortcutInfo: "msc.shortcutInfo",
+  placement: "msc.placement",
   perNotebookOverrides: "msc.perNotebookOverrides"
 };
 async function registerSettings() {
   await joplin.settings.registerSection(SETTINGS.section, {
-    label: "Move Selection to Completed",
-    iconName: "fas fa-check"
+    label: APP_NAME,
+    iconName: "fas fa-paper-plane"
   });
   await joplin.settings.registerSettings({
     [SETTINGS.targetMode]: {
@@ -145,11 +150,12 @@ async function registerSettings() {
       type: SettingItemType.String,
       public: true,
       label: "Destination mode",
-      description: "Choose whether moved text always goes to one note or to a per-notebook \u201CCompleted\u201D note.",
+      description: "Choose whether sent text always goes to one note or to a per-notebook destination note.",
       section: SETTINGS.section,
+      isEnum: true,
       options: {
         global: "Single destination note (set below)",
-        perNotebook: "Per notebook \u201CCompleted\u201D note"
+        perNotebook: "Per-notebook destination note"
       }
     },
     [SETTINGS.targetNoteLabel]: {
@@ -157,7 +163,7 @@ async function registerSettings() {
       type: SettingItemType.String,
       public: true,
       label: "Single destination note",
-      description: "Filled by \u201CSet Single Destination to Current Note\u201D. Leave blank to let the plugin create one when needed.",
+      description: 'Filled by "Set single destination to current note". Leave blank to let Auto Appender create one when needed.',
       section: SETTINGS.section
     },
     [SETTINGS.targetNoteId]: {
@@ -177,27 +183,40 @@ async function registerSettings() {
       type: SettingItemType.String,
       public: true,
       label: "When creating a global note, place it in notebook",
-      description: "Optional notebook path (e.g. \u201CProjects/Archive\u201D). Leave blank to create the note at the top level.",
+      description: "Optional notebook path, such as Projects/Archive. Leave blank to create the note at the top level.",
       section: SETTINGS.section
     },
     [SETTINGS.completedNoteName]: {
       value: "Completed Items",
       type: SettingItemType.String,
       public: true,
-      label: "Per-notebook note title",
+      label: "Destination note title",
       description: "Used in per-notebook mode. A note with this title is created inside each notebook when needed.",
       section: SETTINGS.section
+    },
+    [SETTINGS.placement]: {
+      value: "prepend",
+      type: SettingItemType.String,
+      public: true,
+      label: "Placement in destination note",
+      description: "Choose whether sent text is added to the top or bottom of the destination note.",
+      section: SETTINGS.section,
+      isEnum: true,
+      options: {
+        prepend: "Prepend to top",
+        append: "Append to bottom"
+      }
     },
     [SETTINGS.headerEnabled]: {
       value: true,
       type: SettingItemType.Bool,
       public: true,
       label: "Prepend header",
-      description: "Adds a header before the moved text using the template below.",
+      description: "Adds a header before the sent text using the template below.",
       section: SETTINGS.section
     },
     [SETTINGS.headerTemplate]: {
-      value: '### {{date:YYYY-MM-DD}} \u2014 from "{{title}}"',
+      value: '### {{date:YYYY-MM-DD}} - from "{{title}}"',
       type: SettingItemType.String,
       public: true,
       label: "Header template",
@@ -209,8 +228,9 @@ async function registerSettings() {
       type: SettingItemType.String,
       public: true,
       label: "When nothing is selected",
-      description: "Choose what to move if no text is selected.",
+      description: "Choose what Auto Appender sends if no text is selected.",
       section: SETTINGS.section,
+      isEnum: true,
       options: {
         line: "Current line",
         taskBlock: "Markdown task block",
@@ -222,7 +242,7 @@ async function registerSettings() {
       type: SettingItemType.Bool,
       public: true,
       label: "Auto-complete single task lines",
-      description: "When a lone \u201C- [ ]\u201D line is moved, mark it as \u201C- [x]\u201D.",
+      description: 'When a lone "- [ ]" line is sent, add it to the destination as "- [x]".',
       section: SETTINGS.section
     },
     [SETTINGS.dateLocale]: {
@@ -233,12 +253,12 @@ async function registerSettings() {
       description: "Locale passed to toLocaleDateString when {{date}} is used without a custom format (e.g. en-US, en-GB).",
       section: SETTINGS.section
     },
-    [SETTINGS.commandShortcut]: {
-      value: "Ctrl+Shift+M",
+    [SETTINGS.shortcutInfo]: {
+      value: DEFAULT_SHORTCUT,
       type: SettingItemType.String,
       public: true,
-      label: "Tools menu shortcut",
-      description: "Accelerator shown next to the Tools menu command (e.g. Ctrl+Alt+M). For OS-wide shortcuts, also assign one under Options \u2192 Keyboard Shortcuts.",
+      label: "Default shortcut",
+      description: `Auto Appender registers ${DEFAULT_SHORTCUT} on its Tools menu item. You can override the command in Joplin under Tools > Options > Keyboard Shortcuts by searching for Auto Appender.`,
       section: SETTINGS.section
     }
   });
@@ -283,16 +303,28 @@ function handleBridgeMessage(raw) {
   if (!id) {
     if (msg?.event === "MSC_DEBUG") {
       const details = JSON.stringify(msg.data ?? msg, null, 2);
-      console.info("[MSC debug]", details);
+      console.info("[Auto Appender debug]", details);
     }
     return;
   }
   const pending = pendingBridgeRequests.get(id);
   if (!pending) return;
-  pendingBridgeRequests.delete(id);
-  clearTimeout(pending.timeout);
-  if (msg.ok) pending.resolve(msg.data);
-  else pending.reject(new Error(msg.error || "Bridge error"));
+  if (pending.closed) return;
+  if (msg.ok) {
+    pending.closed = true;
+    pendingBridgeRequests.delete(id);
+    clearTimeout(pending.timeout);
+    pending.resolve(msg.data);
+    return;
+  }
+  pending.completedResponses += 1;
+  pending.errors.push(msg.error || "Bridge error");
+  if (pending.expectedResponses > 0 && pending.completedResponses >= pending.expectedResponses) {
+    pending.closed = true;
+    pendingBridgeRequests.delete(id);
+    clearTimeout(pending.timeout);
+    pending.reject(new Error(pending.errors.join("; ")));
+  }
 }
 async function ensureBridgeListener() {
   if (bridgeListenerRegistered) return;
@@ -300,9 +332,8 @@ async function ensureBridgeListener() {
   if (typeof cs?.onMessage === "function") {
     try {
       await cs.onMessage(BRIDGE_NAME, (raw) => handleBridgeMessage(raw));
-      await cs.onMessage(HTML_BRIDGE_NAME, (raw) => handleBridgeMessage(raw));
     } catch (err) {
-      console.info("[MSC debug] contentScripts.onMessage unavailable:", err?.message || err);
+      console.info("[Auto Appender debug] contentScripts.onMessage unavailable:", err?.message || err);
     }
   }
   if (!bridgeWindowUnsub) {
@@ -318,27 +349,39 @@ async function bridgeRequest(type, payload) {
   const id = Math.random().toString(36).slice(2);
   return new Promise(async (resolve, reject) => {
     const timeout = setTimeout(() => {
+      const pending2 = pendingBridgeRequests.get(id);
       pendingBridgeRequests.delete(id);
-      reject(new Error("Editor bridge timeout"));
-    }, 3e3);
-    pendingBridgeRequests.set(id, { resolve, reject, timeout });
+      if (!pending2 || pending2.closed) return;
+      pending2.closed = true;
+      const details = pending2.errors.length ? `: ${pending2.errors.join("; ")}` : "";
+      reject(new Error(`Editor bridge timeout${details}`));
+    }, 1200);
+    const pending = {
+      resolve,
+      reject,
+      timeout,
+      expectedResponses: 0,
+      completedResponses: 0,
+      errors: [],
+      closed: false
+    };
+    pendingBridgeRequests.set(id, pending);
     let sent = false;
     const cs = joplin.contentScripts;
     if (typeof cs?.postMessage === "function") {
+      pending.expectedResponses += 1;
       try {
         await cs.postMessage(BRIDGE_NAME, { type, requestId: id, payload });
         sent = true;
       } catch {
-      }
-      try {
-        await cs.postMessage(HTML_BRIDGE_NAME, { type, requestId: id, payload });
-        sent = true;
-      } catch {
+        pending.expectedResponses -= 1;
       }
     }
     if (!sent) {
+      pending.expectedResponses += 1;
       const res = await tryInvokeWindow("postMessage", { __MSC_REQ__: { type, requestId: id, payload } });
       if (res.ok) sent = true;
+      else pending.expectedResponses -= 1;
     }
     if (!sent) {
       clearTimeout(timeout);
@@ -351,22 +394,9 @@ async function bridgeRequest(type, payload) {
     }
   });
 }
-async function getSelectionContext() {
-  const data = await bridgeRequest("GET_SELECTION_CONTEXT");
+async function takeMoveTextViaBridge(fallback) {
+  const data = await bridgeRequest("TAKE_MOVE_TEXT", { fallback });
   return data;
-}
-async function getCurrentLineViaBridge() {
-  return bridgeRequest("GET_CURRENT_LINE");
-}
-async function getTaskBlockViaBridge() {
-  return bridgeRequest("GET_TASK_BLOCK");
-}
-async function cutRangesViaBridge(ranges) {
-  const data = await bridgeRequest("CUT_RANGES", { ranges });
-  return data.updatedDocText;
-}
-async function restoreCursorViaBridge(index) {
-  await bridgeRequest("RESTORE_CURSOR", { index });
 }
 async function getSelectedNote() {
   const note = await joplin.workspace.selectedNote();
@@ -408,7 +438,7 @@ async function findOrCreateTargetNote(source) {
       parentId = await resolveFolderPath(targetParentPath);
       if (!parentId) {
         await joplin.views.dialogs.showMessageBox(
-          `Move Selection: could not find notebook path "${targetParentPath}". The global note will be created at the top level instead.`
+          `${APP_NAME}: could not find notebook path "${targetParentPath}". The global note will be created at the top level instead.`
         );
       }
     }
@@ -459,7 +489,7 @@ async function storeGlobalTargetNote(note) {
   try {
     if (note.parent_id) {
       const folder = await joplin.data.get(["folders", note.parent_id], { fields: ["id", "title"] });
-      if (folder?.title) label = `${label} \u2014 ${folder.title}`;
+      if (folder?.title) label = `${label} - ${folder.title}`;
     }
   } catch {
   }
@@ -492,78 +522,181 @@ async function safePutNoteBody(noteId, newBody, prevUpdated) {
   }
   await joplin.data.put(["notes", noteId], null, { body: newBody });
 }
-async function prependToNote(target, block, header) {
-  const current = await joplin.data.get(["notes", target.id], { fields: ["id", "body"] });
-  const newBody = `${header ? header + "\n" : ""}${block}
-
-${current.body || ""}`;
-  await safePutNoteBody(target.id, newBody, target.updated_time);
+function queueFor(map, key) {
+  let queue = map.get(key);
+  if (!queue) {
+    queue = createSerialQueue();
+    map.set(key, queue);
+  }
+  return queue;
+}
+async function enqueueSourceBodyWrite(noteId, newBody, prevUpdated) {
+  const queue = queueFor(sourceWriteQueues, noteId);
+  await queue(() => safePutNoteBody(noteId, newBody, prevUpdated));
+}
+async function insertIntoNote(target, block, header, placement) {
+  const queue = queueFor(targetWriteQueues, target.id);
+  await queue(async () => {
+    const current = await joplin.data.get(["notes", target.id], { fields: ["id", "body", "updated_time"] });
+    const newBody = insertBlockIntoBody(current.body || "", block, header, placement);
+    await safePutNoteBody(target.id, newBody, current.updated_time);
+  });
+}
+async function showToast(message, type = ToastType.Info, duration = 3500) {
+  try {
+    await joplin.views.dialogs.showToast({ message, type, duration, timestamp: Date.now() });
+  } catch {
+  }
+}
+async function showMoveToast(operationId, message, type = ToastType.Success) {
+  if (!isCurrentOperation(operationId, latestMoveOperationId)) return;
+  await showToast(message, type);
+}
+function currentPlacement(value) {
+  return value === "append" ? "append" : "prepend";
+}
+function currentFallback(value) {
+  if (value === "line" || value === "none") return value;
+  return "taskBlock";
+}
+async function showSetupDialog() {
+  if (!setupDialogHandle) {
+    setupDialogHandle = await joplin.views.dialogs.create("autoAppender.setup");
+    try {
+      await joplin.views.dialogs.setFitToContent(setupDialogHandle, true);
+    } catch {
+    }
+  }
+  const selectedNote = await getSelectedNote();
+  const selectedFolder = !selectedNote ? await joplin.workspace.selectedFolder() : null;
+  const folderId = selectedNote?.parent_id || selectedFolder?.id || "";
+  const folderTitle = folderId ? selectedNote?.parent_id ? await getFolderTitle(selectedNote.parent_id) : selectedFolder?.title || await getFolderTitle(folderId) : "";
+  const overrides = await getNotebookOverrides();
+  const overrideId = folderId ? overrides[folderId] : "";
+  const mode = await joplin.settings.value(SETTINGS.targetMode);
+  const globalLabel = await joplin.settings.value(SETTINGS.targetNoteLabel) || "Not set; Auto Appender will create one when needed";
+  const placement = currentPlacement(await joplin.settings.value(SETTINGS.placement));
+  const fallback = currentFallback(await joplin.settings.value(SETTINGS.fallback));
+  let overrideLabel = folderId ? "No notebook override set" : "Select a note or notebook to inspect overrides";
+  if (overrideId) {
+    try {
+      const note = await joplin.data.get(["notes", overrideId], { fields: ["id", "title"] });
+      overrideLabel = note?.title ? `${note.title} (${overrideId})` : overrideId;
+    } catch {
+      overrideLabel = "Saved override is stale and will be ignored when sending text";
+    }
+  }
+  const html = `
+    <style>
+      body { color: var(--joplin-color); font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 16px; }
+      h1 { font-size: 18px; margin: 0 0 8px; }
+      p { color: var(--joplin-color-faded); margin: 0 0 12px; }
+      dl { display: grid; gap: 8px 12px; grid-template-columns: max-content minmax(0, 1fr); margin: 12px 0; }
+      dt { color: var(--joplin-color-faded); }
+      dd { margin: 0; overflow-wrap: anywhere; }
+      .hint { border-left: 3px solid var(--joplin-selected-color, #5b8def); margin-top: 12px; padding: 8px 10px; }
+      code { background: var(--joplin-background-color-hover, rgba(127,127,127,.14)); border-radius: 3px; padding: 1px 4px; }
+    </style>
+    <h1>${APP_NAME}</h1>
+    <p>Send selected text to a destination note without leaving the note you are editing.</p>
+    <dl>
+      <dt>Shortcut</dt><dd><code>${escapeHtml(DEFAULT_SHORTCUT)}</code> by default. Change it in Joplin Keyboard Shortcuts by searching for Auto Appender.</dd>
+      <dt>Destination mode</dt><dd>${escapeHtml(mode === "perNotebook" ? "Per-notebook destination note" : "Single destination note")}</dd>
+      <dt>Single destination</dt><dd>${escapeHtml(globalLabel)}</dd>
+      <dt>Selected notebook</dt><dd>${escapeHtml(folderTitle || "No notebook selected")}</dd>
+      <dt>Notebook override</dt><dd>${escapeHtml(overrideLabel)}</dd>
+      <dt>Placement</dt><dd>${escapeHtml(placement === "append" ? "Append to bottom" : "Prepend to top")}</dd>
+      <dt>No selection</dt><dd>${escapeHtml(fallback === "taskBlock" ? "Send the current Markdown task block" : fallback === "line" ? "Send the current line" : "Do nothing")}</dd>
+    </dl>
+    <div class="hint">Use the buttons below to point Auto Appender at the currently selected note.</div>
+  `;
+  await joplin.views.dialogs.setHtml(setupDialogHandle, html);
+  await joplin.views.dialogs.setButtons(setupDialogHandle, [
+    { id: "setSingle", title: "Set single destination" },
+    { id: "setNotebook", title: "Set notebook destination" },
+    { id: "clearNotebook", title: "Clear notebook override" },
+    { id: "close", title: "Close" }
+  ]);
+  const result = await joplin.views.dialogs.open(setupDialogHandle);
+  if (result.id === "setSingle") {
+    const note = await getSelectedNote();
+    if (!note) {
+      await joplin.views.dialogs.showMessageBox(`${APP_NAME}: select a note first.`);
+      return;
+    }
+    await storeGlobalTargetNote(note);
+    await showToast(`Single destination set to "${note.title || "(untitled note)"}".`);
+  } else if (result.id === "setNotebook") {
+    const note = await getSelectedNote();
+    if (!note?.parent_id) {
+      await joplin.views.dialogs.showMessageBox(`${APP_NAME}: select a note inside the notebook first.`);
+      return;
+    }
+    await setNotebookOverride(note.parent_id, note.id);
+    const title = await getFolderTitle(note.parent_id);
+    await showToast(`Notebook destination for "${title}" set to "${note.title || "(untitled note)"}".`);
+  } else if (result.id === "clearNotebook") {
+    if (!folderId) {
+      await joplin.views.dialogs.showMessageBox(`${APP_NAME}: select a note or notebook first.`);
+      return;
+    }
+    await setNotebookOverride(folderId, null);
+    await showToast(`Notebook destination override cleared for "${folderTitle || "selected notebook"}".`);
+  }
+}
+function escapeHtml(value) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 joplin.plugins.register({
   onStart: async () => {
     await registerSettings();
     await syncGlobalTargetLabel();
-    const accelerator = (await joplin.settings.value(SETTINGS.commandShortcut))?.trim();
     await joplin.contentScripts.register(
       ContentScriptType.CodeMirrorPlugin,
       BRIDGE_NAME,
       "./cm-bridge.js"
     );
-    await joplin.contentScripts.register(
-      ContentScriptType.HtmlPlugin,
-      HTML_BRIDGE_NAME,
-      "./cm-bridge.js"
-    );
     await joplin.commands.register({
-      name: "moveSelectionToCompleted",
-      label: "Move Selection to Completed",
-      iconName: "fas fa-arrow-up",
+      name: "autoAppender.sendToDestination",
+      label: "Auto Appender: Send to destination note",
+      iconName: "fas fa-paper-plane",
       execute: async () => {
+        const operationId = ++latestMoveOperationId;
+        let capturedTextForRecovery = "";
         try {
           const source = await getSelectedNote();
           if (!source) return;
-          let ctx;
+          const fallback = currentFallback(await joplin.settings.value(SETTINGS.fallback));
+          let taken;
           try {
-            ctx = await getSelectionContext();
+            taken = await takeMoveTextViaBridge(fallback);
           } catch (err) {
-            const msg = err?.message ? `Move Selection: ${err.message}` : "Move Selection: editor bridge unavailable. Click into the note editor and try again.";
+            const msg = err?.message ? `${APP_NAME}: ${err.message}` : `${APP_NAME}: editor bridge unavailable. Click into the note editor and try again.`;
             await joplin.views.dialogs.showMessageBox(msg);
             return;
           }
-          let movedText = ctx.text?.trimEnd() ?? "";
-          let ranges = ctx.ranges || [];
-          const cursorIdx = ctx.cursorIndex ?? 0;
-          let editorImpl = ctx.impl;
-          if (!movedText) {
-            const fb = await joplin.settings.value(SETTINGS.fallback);
-            if (fb === "none") {
-              await joplin.views.dialogs.showMessageBox("Move Selection: nothing selected.");
-              return;
-            }
-            const fbData = fb === "line" ? await getCurrentLineViaBridge() : await getTaskBlockViaBridge();
-            movedText = (fbData.text || "").trimEnd();
-            ranges = fbData.ranges || [];
-            editorImpl = fbData.impl ?? editorImpl;
-          }
-          if (!movedText || ranges.length === 0) {
-            await joplin.views.dialogs.showMessageBox("Move Selection: nothing to move.");
+          let movedText = taken.text?.trimEnd() ?? "";
+          capturedTextForRecovery = movedText;
+          if (!movedText || !taken.ranges?.length) {
+            if (fallback === "none") await showMoveToast(operationId, `${APP_NAME}: nothing selected.`, ToastType.Info);
+            else await showMoveToast(operationId, `${APP_NAME}: nothing to send.`, ToastType.Info);
             return;
           }
           const toggle = await joplin.settings.value(SETTINGS.autoToggleTask);
           movedText = toggleTaskIfSingleLine(movedText, toggle);
-          const updatedDocText = await cutRangesViaBridge(ranges);
-          if (editorImpl === "tinymce") {
+          if (taken.impl === "tinymce") {
             try {
               await joplin.commands.execute("editor.save");
             } catch {
             }
           } else {
-            await safePutNoteBody(source.id, updatedDocText, source.updated_time);
+            await enqueueSourceBodyWrite(source.id, taken.updatedDocText, source.updated_time);
           }
           const target = await findOrCreateTargetNote(source);
           const headerEnabled = await joplin.settings.value(SETTINGS.headerEnabled);
           const tpl = await joplin.settings.value(SETTINGS.headerTemplate);
           const locale = await joplin.settings.value(SETTINGS.dateLocale);
+          const placement = currentPlacement(await joplin.settings.value(SETTINGS.placement));
           const folder = await joplin.data.get(["folders", source.parent_id], { fields: ["id", "title"] });
           const header = headerEnabled ? formatHeader(tpl, {
             date: /* @__PURE__ */ new Date(),
@@ -571,55 +704,61 @@ joplin.plugins.register({
             notebook: folder?.title || "",
             locale
           }) : null;
-          await prependToNote(target, movedText, header);
-          await restoreCursorViaBridge(cursorIdx);
+          await insertIntoNote(target, movedText, header, placement);
+          await showMoveToast(operationId, `Sent to "${target.title || "(untitled note)"}".`);
         } catch (err) {
+          if (!isCurrentOperation(operationId, latestMoveOperationId) && !capturedTextForRecovery) return;
+          const recovery = capturedTextForRecovery ? `
+
+The text was already removed from the editor. Captured text for recovery:
+
+${capturedTextForRecovery}` : "";
           await joplin.views.dialogs.showMessageBox(
-            `Move Selection failed: ${err?.message || String(err)}`
+            `${APP_NAME} failed: ${err?.message || String(err)}${recovery}`
           );
         }
       }
     });
     await joplin.commands.register({
-      name: "mscSetSingleDestinationToCurrent",
-      label: "Set Single Destination to Current Note",
+      name: "autoAppender.setSingleDestinationToCurrent",
+      label: "Auto Appender: Set single destination to current note",
       iconName: "fas fa-thumbtack",
       execute: async (context) => {
         const note = await getNoteFromContext(context);
         if (!note) {
-          await joplin.views.dialogs.showMessageBox("Move Selection: select a note first.");
+          await joplin.views.dialogs.showMessageBox(`${APP_NAME}: select a note first.`);
           return;
         }
         await storeGlobalTargetNote(note);
-        await joplin.views.dialogs.showMessageBox(
+        await showToast(
           `Single destination set to "${note.title || "(untitled note)"}".`
         );
       }
     });
     await joplin.commands.register({
-      name: "mscSetNotebookDestinationToCurrent",
-      label: "Set Notebook Destination to Current Note",
+      name: "autoAppender.setNotebookDestinationToCurrent",
+      label: "Auto Appender: Set notebook destination to current note",
       iconName: "fas fa-folder-open",
       execute: async (context) => {
         const note = await getNoteFromContext(context);
         if (!note) {
-          await joplin.views.dialogs.showMessageBox("Move Selection: select a note first.");
+          await joplin.views.dialogs.showMessageBox(`${APP_NAME}: select a note first.`);
           return;
         }
         if (!note.parent_id) {
-          await joplin.views.dialogs.showMessageBox("Move Selection: note is missing a parent notebook.");
+          await joplin.views.dialogs.showMessageBox(`${APP_NAME}: note is missing a parent notebook.`);
           return;
         }
         await setNotebookOverride(note.parent_id, note.id);
         const folderTitle = await getFolderTitle(note.parent_id);
-        await joplin.views.dialogs.showMessageBox(
+        await showToast(
           `Notebook destination for "${folderTitle}" set to "${note.title || "(untitled note)"}".`
         );
       }
     });
     await joplin.commands.register({
-      name: "mscClearNotebookDestination",
-      label: "Clear Notebook Destination Override",
+      name: "autoAppender.clearNotebookDestination",
+      label: "Auto Appender: Clear notebook destination override",
       iconName: "fas fa-eraser",
       execute: async (context) => {
         let note = await getNoteFromContext(context);
@@ -634,64 +773,76 @@ joplin.plugins.register({
         }
         if (!folderId) {
           await joplin.views.dialogs.showMessageBox(
-            "Move Selection: select a note (or notebook) first to clear its override."
+            `${APP_NAME}: select a note or notebook first to clear its override.`
           );
           return;
         }
         await setNotebookOverride(folderId, null);
         if (!folderTitle) folderTitle = await getFolderTitle(folderId);
-        await joplin.views.dialogs.showMessageBox(
+        await showToast(
           `Notebook destination override cleared for "${folderTitle}".`
         );
       }
     });
-    const createMenus = async (acc) => {
-      await removeMenuItem("msc-menu-move");
-      await removeMenuItem("msc-menu-set-single");
-      await removeMenuItem("msc-menu-set-notebook");
-      await removeMenuItem("msc-menu-clear-notebook");
-      await removeMenuItem("msc-context-set-notebook");
-      await removeMenuItem("msc-context-clear-notebook");
+    await joplin.commands.register({
+      name: "autoAppender.openSetup",
+      label: "Auto Appender: Open setup",
+      iconName: "fas fa-sliders-h",
+      execute: async () => {
+        await showSetupDialog();
+      }
+    });
+    const createMenus = async () => {
       await joplin.views.menuItems.create(
-        "msc-menu-move",
-        "moveSelectionToCompleted",
+        "auto-appender-menu-send",
+        "autoAppender.sendToDestination",
         MenuItemLocation.Tools,
-        acc ? { accelerator: acc } : void 0
+        { accelerator: DEFAULT_SHORTCUT }
       );
       await joplin.views.menuItems.create(
-        "msc-menu-set-single",
-        "mscSetSingleDestinationToCurrent",
+        "auto-appender-menu-setup",
+        "autoAppender.openSetup",
         MenuItemLocation.Tools
       );
       await joplin.views.menuItems.create(
-        "msc-menu-set-notebook",
-        "mscSetNotebookDestinationToCurrent",
+        "auto-appender-menu-set-single",
+        "autoAppender.setSingleDestinationToCurrent",
         MenuItemLocation.Tools
       );
       await joplin.views.menuItems.create(
-        "msc-menu-clear-notebook",
-        "mscClearNotebookDestination",
+        "auto-appender-menu-set-notebook",
+        "autoAppender.setNotebookDestinationToCurrent",
         MenuItemLocation.Tools
       );
       await joplin.views.menuItems.create(
-        "msc-context-set-notebook",
-        "mscSetNotebookDestinationToCurrent",
+        "auto-appender-menu-clear-notebook",
+        "autoAppender.clearNotebookDestination",
+        MenuItemLocation.Tools
+      );
+      await joplin.views.menuItems.create(
+        "auto-appender-context-set-notebook",
+        "autoAppender.setNotebookDestinationToCurrent",
         MenuItemLocation.NoteListContextMenu
       );
       await joplin.views.menuItems.create(
-        "msc-context-clear-notebook",
-        "mscClearNotebookDestination",
+        "auto-appender-context-clear-notebook",
+        "autoAppender.clearNotebookDestination",
         MenuItemLocation.NoteListContextMenu
       );
     };
-    await createMenus(accelerator);
+    await createMenus();
+    await joplin.views.toolbarButtons.create(
+      "auto-appender-toolbar-send",
+      "autoAppender.sendToDestination",
+      ToolbarButtonLocation.NoteToolbar
+    );
     await joplin.settings.onChange(async ({ keys }) => {
-      if (keys.includes(SETTINGS.commandShortcut)) {
-        const acc = (await joplin.settings.value(SETTINGS.commandShortcut))?.trim();
-        await createMenus(acc);
-      }
       if (keys.includes(SETTINGS.targetNoteId)) {
         await syncGlobalTargetLabel();
+      }
+      if (keys.includes(SETTINGS.shortcutInfo)) {
+        const current = await joplin.settings.value(SETTINGS.shortcutInfo);
+        if (current !== DEFAULT_SHORTCUT) await joplin.settings.setValue(SETTINGS.shortcutInfo, DEFAULT_SHORTCUT);
       }
     });
   }

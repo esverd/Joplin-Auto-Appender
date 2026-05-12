@@ -1,7 +1,14 @@
-/* Content script runs inside the note editor (CodeMirror or TinyMCE).
+/* Content script runs inside the Markdown editor via Joplin's CodeMirror API.
    We expose editor operations callable via the plugin through a simple
-   message bridge that works across the different editor implementations. */
-type Range = { from: number; to: number };
+   message bridge. */
+import {
+  expandMarkdownTaskBlock,
+  normalizeRanges,
+  type SelectionFallback,
+  type SelectionRange
+} from './utils';
+
+type Range = SelectionRange;
 
 type SelectionPayload = {
   impl: 'cm6' | 'cm5' | 'tinymce';
@@ -11,6 +18,10 @@ type SelectionPayload = {
   docText: string;
   docHtml?: string;
   html?: string;
+};
+
+type TakeMovePayload = {
+  fallback?: SelectionFallback;
 };
 
 const webviewApi = (window as any).webviewApi;
@@ -111,15 +122,14 @@ const Bridge = (() => {
   }
 
   function cutRanges(ranges: Range[]): string {
-    const info = getDocAndSelection();
-    if (info.impl === 'cm6' && lastContext?.impl === 'cm6') {
+    if (lastContext?.impl === 'cm6') {
       const view = lastContext.view;
       const norm = normalizeRanges(ranges);
       view.dispatch({ changes: norm.map((r) => ({ from: r.from, to: r.to, insert: '' })) });
       return view.state.doc.toString();
     }
 
-    if (info.impl === 'cm5' && lastContext?.impl === 'cm5') {
+    if (lastContext?.impl === 'cm5') {
       const cm = lastContext.cm;
       const doc = cm.getDoc();
       const norm = normalizeRanges(ranges);
@@ -131,7 +141,7 @@ const Bridge = (() => {
       return doc.getValue();
     }
 
-    if (info.impl === 'tinymce' && lastContext?.impl === 'tinymce') {
+    if (lastContext?.impl === 'tinymce') {
       const editor = getTinymceEditor();
       if (!editor) throw new Error('Rich text editor unavailable');
       const ctx = lastContext as TinymceCtx & { impl: 'tinymce' };
@@ -145,6 +155,59 @@ const Bridge = (() => {
     }
 
     throw new Error('Unable to cut selection');
+  }
+
+  function takeMoveText(payload?: TakeMovePayload) {
+    let ctx = getDocAndSelection();
+    let movedText = (ctx.text || '').trimEnd();
+    let ranges = ctx.ranges || [];
+    let takenKind: 'selection' | SelectionFallback = 'selection';
+
+    if (!movedText) {
+      const fallback = payload?.fallback || 'taskBlock';
+      takenKind = fallback;
+      if (fallback === 'none') {
+        return {
+          impl: ctx.impl,
+          text: '',
+          ranges: [],
+          cursorIndex: ctx.cursorIndex ?? 0,
+          updatedDocText: ctx.docText,
+          takenKind
+        };
+      }
+
+      const fallbackData = fallback === 'line' ? getCurrentLine() : getTaskBlock();
+      movedText = (fallbackData.text || '').trimEnd();
+      ranges = [fallbackData.range];
+      ctx = {
+        ...ctx,
+        impl: fallbackData.impl,
+        ranges,
+        text: movedText
+      };
+    }
+
+    if (!movedText || !ranges.length) {
+      return {
+        impl: ctx.impl,
+        text: '',
+        ranges: [],
+        cursorIndex: ctx.cursorIndex ?? 0,
+        updatedDocText: ctx.docText,
+        takenKind
+      };
+    }
+
+    const updatedDocText = cutRanges(ranges);
+    return {
+      impl: ctx.impl,
+      text: movedText,
+      ranges,
+      cursorIndex: ctx.cursorIndex ?? 0,
+      updatedDocText,
+      takenKind
+    };
   }
 
   function getCurrentLine(): { text: string; range: Range; impl: SelectionPayload['impl'] } {
@@ -176,14 +239,14 @@ const Bridge = (() => {
   function getTaskBlock(): { text: string; range: Range; impl: SelectionPayload['impl'] } {
     const info = getDocAndSelection();
     if (info.impl === 'cm6' && lastContext?.impl === 'cm6') {
-      const data = expandTaskBlock(info.docText, info.cursorIndex);
+      const data = expandMarkdownTaskBlock(info.docText, info.cursorIndex);
       return { text: data.text, range: data.range, impl: 'cm6' };
     }
     if (info.impl === 'cm5' && lastContext?.impl === 'cm5') {
       const doc = lastContext.cm.getDoc();
       const docText = doc.getValue();
       const cursorIndex = doc.indexFromPos(doc.getCursor());
-      const data = expandTaskBlock(docText, cursorIndex);
+      const data = expandMarkdownTaskBlock(docText, cursorIndex);
       return { text: data.text, range: data.range, impl: 'cm5' };
     }
     if (info.impl === 'tinymce') {
@@ -248,6 +311,10 @@ const Bridge = (() => {
       const { type, requestId, payload } = msg || {};
       try {
         switch (type) {
+          case 'TAKE_MOVE_TEXT': {
+            post({ requestId, ok: true, data: takeMoveText(payload as TakeMovePayload) });
+            break;
+          }
           case 'GET_SELECTION_CONTEXT': {
             const ctx = getDocAndSelection();
             post({ requestId, ok: true, data: ctx });
@@ -282,44 +349,6 @@ const Bridge = (() => {
     }
   };
 })();
-
-function normalizeRanges(ranges: Range[]): Range[] {
-  return ranges
-    .map((r) => ({ from: Math.min(r.from, r.to), to: Math.max(r.from, r.to) }))
-    .sort((a, b) => b.from - a.from);
-}
-
-function expandTaskBlock(docText: string, cursorIndex: number) {
-  const lines = docText.split(/\r?\n/);
-  const starts: number[] = [];
-  let idx = 0;
-  for (const line of lines) {
-    starts.push(idx);
-    idx += line.length + 1;
-  }
-  let lineIdx = lines.length - 1;
-  for (let i = 0; i < starts.length; i++) {
-    if (starts[i] > cursorIndex) {
-      lineIdx = i - 1;
-      break;
-    }
-    if (i === starts.length - 1) lineIdx = i;
-  }
-  const isTodo = (i: number) => i >= 0 && i < lines.length && /^\s*-\s\[( |x|X)\]\s/.test(lines[i]);
-  if (!isTodo(lineIdx)) {
-    const lstart = starts[lineIdx];
-    const lend = lstart + lines[lineIdx].length;
-    return { text: lines[lineIdx], range: { from: lstart, to: lend } };
-  }
-  let top = lineIdx;
-  let bot = lineIdx;
-  while (isTodo(top - 1)) top--;
-  while (isTodo(bot + 1)) bot++;
-  const from = starts[top];
-  const to = starts[bot] + lines[bot].length;
-  const text = lines.slice(top, bot + 1).join('\n');
-  return { text, range: { from, to } };
-}
 
 function getTinymceEditor(): any {
   const tinymce = (window as any).tinymce;
