@@ -40,6 +40,31 @@
   var webviewApi = window.webviewApi;
   var lastContext = null;
   var Bridge = /* @__PURE__ */ (() => {
+    const responseCache = /* @__PURE__ */ new Map();
+    const responseCacheTtlMs = 5e3;
+    function cachedResponse(requestId) {
+      if (typeof requestId !== "string" || !requestId) return null;
+      const cached = responseCache.get(requestId);
+      if (!cached) return null;
+      if (cached.expiresAt <= Date.now()) {
+        responseCache.delete(requestId);
+        return null;
+      }
+      return cached.response;
+    }
+    function cacheResponse(requestId, response) {
+      if (typeof requestId !== "string" || !requestId) return;
+      const now = Date.now();
+      for (const [id, cached] of responseCache) {
+        if (cached.expiresAt <= now) responseCache.delete(id);
+      }
+      responseCache.set(requestId, { expiresAt: now + responseCacheTtlMs, response });
+    }
+    function respond(requestId, ok, data, error) {
+      const response = ok ? { requestId, ok: true, data } : { requestId, ok: false, error };
+      cacheResponse(requestId, response);
+      post(response);
+    }
     function getDocAndSelection() {
       const w = window;
       const cm6 = w.cm6;
@@ -290,42 +315,48 @@
     return {
       handleMessage(msg) {
         const { type, requestId, payload } = msg || {};
+        if (typeof type !== "string") return;
+        const cached = cachedResponse(requestId);
+        if (cached) {
+          post(cached);
+          return;
+        }
         try {
           switch (type) {
             case "TAKE_MOVE_TEXT": {
-              post({ requestId, ok: true, data: takeMoveText(payload) });
+              respond(requestId, true, takeMoveText(payload));
               break;
             }
             case "GET_SELECTION_CONTEXT": {
               const ctx = getDocAndSelection();
-              post({ requestId, ok: true, data: ctx });
+              respond(requestId, true, ctx);
               break;
             }
             case "GET_CURRENT_LINE": {
               const { text, range, impl } = getCurrentLine();
-              post({ requestId, ok: true, data: { text, ranges: [range], impl } });
+              respond(requestId, true, { text, ranges: [range], impl });
               break;
             }
             case "GET_TASK_BLOCK": {
               const { text, range, impl } = getTaskBlock();
-              post({ requestId, ok: true, data: { text, ranges: [range], impl } });
+              respond(requestId, true, { text, ranges: [range], impl });
               break;
             }
             case "CUT_RANGES": {
               const updated = cutRanges(payload.ranges);
-              post({ requestId, ok: true, data: { updatedDocText: updated } });
+              respond(requestId, true, { updatedDocText: updated });
               break;
             }
             case "RESTORE_CURSOR": {
               setCursor(payload.index ?? 0);
-              post({ requestId, ok: true, data: true });
+              respond(requestId, true, true);
               break;
             }
             default:
-              post({ requestId, ok: false, error: "Unknown message type" });
+              respond(requestId, false, void 0, "Unknown message type");
           }
         } catch (e) {
-          post({ requestId, ok: false, error: e?.message || String(e) });
+          respond(requestId, false, void 0, e?.message || String(e));
         }
       }
     };
@@ -380,14 +411,14 @@
     if (webviewApi?.onMessage) {
       webviewApi.onMessage((msg) => {
         const data = msg && msg.__MSC_REQ__ ? msg.__MSC_REQ__ : msg;
-        if (!data) return;
+        if (!data || data.__MSC_RES__ || typeof data.type !== "string") return;
         Bridge.handleMessage(data);
       });
     }
     window.addEventListener("message", (ev) => {
       const payload = ev.data || {};
       const data = payload.__MSC_REQ__ || payload;
-      if (!data) return;
+      if (!data || data.__MSC_RES__ || typeof data.type !== "string") return;
       Bridge.handleMessage(data);
     });
   }

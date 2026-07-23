@@ -43,6 +43,7 @@ const pendingBridgeRequests = new Map<string, PendingBridge>();
 let bridgeListenerRegistered = false;
 let bridgeWindowUnsub: (() => void) | null = null;
 let latestMoveOperationId = 0;
+let moveInProgress = false;
 let setupDialogHandle: string | null = null;
 const sourceWriteQueues = new Map<string, ReturnType<typeof createSerialQueue>>();
 const targetWriteQueues = new Map<string, ReturnType<typeof createSerialQueue>>();
@@ -691,6 +692,8 @@ joplin.plugins.register({
       label: 'Auto Appender: Send to destination note',
       iconName: 'fas fa-paper-plane',
       execute: async () => {
+        if (moveInProgress) return;
+        moveInProgress = true;
         const operationId = ++latestMoveOperationId;
         let capturedTextForRecovery = '';
         try {
@@ -759,6 +762,8 @@ joplin.plugins.register({
           await joplin.views.dialogs.showMessageBox(
             `${APP_NAME} failed: ${err?.message || String(err)}${recovery}`
           );
+        } finally {
+          moveInProgress = false;
         }
       }
     });

@@ -85,6 +85,7 @@ var pendingBridgeRequests = /* @__PURE__ */ new Map();
 var bridgeListenerRegistered = false;
 var bridgeWindowUnsub = null;
 var latestMoveOperationId = 0;
+var moveInProgress = false;
 var setupDialogHandle = null;
 var sourceWriteQueues = /* @__PURE__ */ new Map();
 var targetWriteQueues = /* @__PURE__ */ new Map();
@@ -661,6 +662,8 @@ joplin.plugins.register({
       label: "Auto Appender: Send to destination note",
       iconName: "fas fa-paper-plane",
       execute: async () => {
+        if (moveInProgress) return;
+        moveInProgress = true;
         const operationId = ++latestMoveOperationId;
         let capturedTextForRecovery = "";
         try {
@@ -716,6 +719,8 @@ ${capturedTextForRecovery}` : "";
           await joplin.views.dialogs.showMessageBox(
             `${APP_NAME} failed: ${err?.message || String(err)}${recovery}`
           );
+        } finally {
+          moveInProgress = false;
         }
       }
     });
