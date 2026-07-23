@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-test('editor bridge reuses a response when a move request is delivered twice', async () => {
-  let webviewMessageHandler: ((message: any) => void) | undefined;
-  let windowMessageHandler: ((event: { data: any }) => void) | undefined;
+test('editor bridge processes a move request once across reloads and delayed duplicates', async () => {
+  const webviewMessageHandlers: Array<(message: any) => void> = [];
+  const windowMessageHandlers: Array<(event: { data: any }) => void> = [];
   const webviewResponses: any[] = [];
   let docText = 'Before\nHighlighted\n- [ ] Below one\n- [ ] Below two';
   const selectedFrom = docText.indexOf('Highlighted');
@@ -41,14 +41,14 @@ test('editor bridge reuses a response when a move request is delivered twice', a
     cm6: { view },
     webviewApi: {
       onMessage(handler: (message: any) => void) {
-        webviewMessageHandler = handler;
+        webviewMessageHandlers.push(handler);
       },
       postMessage(message: any) {
         webviewResponses.push(message);
       }
     },
     addEventListener(type: string, handler: (event: { data: any }) => void) {
-      if (type === 'message') windowMessageHandler = handler;
+      if (type === 'message') windowMessageHandlers.push(handler);
     },
     postMessage() {
       // The test invokes the subscribed handler directly when needed.
@@ -56,32 +56,48 @@ test('editor bridge reuses a response when a move request is delivered twice', a
     location: { href: 'http://localhost/editor' }
   };
 
-  await import('../src/cm-bridge');
+  const bridgeModulePath = require.resolve('../src/cm-bridge');
+  require(bridgeModulePath);
+  delete require.cache[bridgeModulePath];
+  require(bridgeModulePath);
   await new Promise((resolve) => setTimeout(resolve, 0));
   webviewResponses.length = 0;
 
-  assert.ok(webviewMessageHandler);
-  assert.ok(windowMessageHandler);
+  assert.equal(webviewMessageHandlers.length, 1);
+  assert.equal(windowMessageHandlers.length, 1);
   const request = {
     type: 'TAKE_MOVE_TEXT',
     requestId: 'same-request',
     payload: { fallback: 'taskBlock' }
   };
 
-  webviewMessageHandler!(request);
+  webviewMessageHandlers[0](request);
   const afterFirstCut = docText;
   const firstResponse = webviewResponses[webviewResponses.length - 1]?.__MSC_RES__;
 
   assert.equal(firstResponse.ok, true);
   assert.equal(firstResponse.data.text, 'Highlighted');
 
-  webviewMessageHandler!(request);
+  webviewMessageHandlers[0](request);
   const secondResponse = webviewResponses[webviewResponses.length - 1]?.__MSC_RES__;
 
   assert.equal(docText, afterFirstCut);
   assert.deepEqual(secondResponse, firstResponse);
 
+  const originalDateNow = Date.now;
+  try {
+    Date.now = () => originalDateNow() + 5_001;
+    webviewMessageHandlers[0](request);
+  } finally {
+    Date.now = originalDateNow;
+  }
+
+  const delayedResponse = webviewResponses[webviewResponses.length - 1]?.__MSC_RES__;
+  assert.equal(docText, afterFirstCut);
+  assert.equal(delayedResponse.ok, false);
+  assert.equal(delayedResponse.error, 'Duplicate move request ignored');
+
   const responseCount = webviewResponses.length;
-  windowMessageHandler!({ data: { __MSC_RES__: firstResponse } });
+  windowMessageHandlers[0]({ data: { __MSC_RES__: firstResponse } });
   assert.equal(webviewResponses.length, responseCount);
 });

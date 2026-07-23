@@ -7,3 +7,9 @@ declare module 'node:test' {
   const test: any;
   export default test;
 }
+
+declare const require: {
+  (id: string): any;
+  cache: Record<string, unknown>;
+  resolve(id: string): string;
+};

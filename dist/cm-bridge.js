@@ -38,16 +38,34 @@
 
   // src/cm-bridge.ts
   var webviewApi = window.webviewApi;
+  var BRIDGE_STATE_KEY = "__autoAppenderEditorBridgeState__";
+  function getSharedBridgeState() {
+    const editorWindow = window;
+    const existing = editorWindow[BRIDGE_STATE_KEY];
+    if (existing) {
+      if (!(existing.responseCache instanceof Map)) existing.responseCache = /* @__PURE__ */ new Map();
+      if (!(existing.handledMoveRequestIds instanceof Set)) existing.handledMoveRequestIds = /* @__PURE__ */ new Set();
+      if (typeof existing.subscribed !== "boolean") existing.subscribed = false;
+      return existing;
+    }
+    const created = {
+      responseCache: /* @__PURE__ */ new Map(),
+      handledMoveRequestIds: /* @__PURE__ */ new Set(),
+      subscribed: false
+    };
+    editorWindow[BRIDGE_STATE_KEY] = created;
+    return created;
+  }
   var lastContext = null;
+  var sharedBridgeState = getSharedBridgeState();
   var Bridge = /* @__PURE__ */ (() => {
-    const responseCache = /* @__PURE__ */ new Map();
     const responseCacheTtlMs = 5e3;
     function cachedResponse(requestId) {
       if (typeof requestId !== "string" || !requestId) return null;
-      const cached = responseCache.get(requestId);
+      const cached = sharedBridgeState.responseCache.get(requestId);
       if (!cached) return null;
       if (cached.expiresAt <= Date.now()) {
-        responseCache.delete(requestId);
+        sharedBridgeState.responseCache.delete(requestId);
         return null;
       }
       return cached.response;
@@ -55,10 +73,10 @@
     function cacheResponse(requestId, response) {
       if (typeof requestId !== "string" || !requestId) return;
       const now = Date.now();
-      for (const [id, cached] of responseCache) {
-        if (cached.expiresAt <= now) responseCache.delete(id);
+      for (const [id, cached] of sharedBridgeState.responseCache) {
+        if (cached.expiresAt <= now) sharedBridgeState.responseCache.delete(id);
       }
-      responseCache.set(requestId, { expiresAt: now + responseCacheTtlMs, response });
+      sharedBridgeState.responseCache.set(requestId, { expiresAt: now + responseCacheTtlMs, response });
     }
     function respond(requestId, ok, data, error) {
       const response = ok ? { requestId, ok: true, data } : { requestId, ok: false, error };
@@ -321,10 +339,18 @@
           post(cached);
           return;
         }
+        if (type === "TAKE_MOVE_TEXT" && typeof requestId === "string" && sharedBridgeState.handledMoveRequestIds.has(requestId)) {
+          post({ requestId, ok: false, error: "Duplicate move request ignored" });
+          return;
+        }
         try {
           switch (type) {
             case "TAKE_MOVE_TEXT": {
-              respond(requestId, true, takeMoveText(payload));
+              const data = takeMoveText(payload);
+              if (typeof requestId === "string" && requestId) {
+                sharedBridgeState.handledMoveRequestIds.add(requestId);
+              }
+              respond(requestId, true, data);
               break;
             }
             case "GET_SELECTION_CONTEXT": {
@@ -408,6 +434,8 @@
     window.postMessage(wrapped, "*");
   }
   function subscribe() {
+    if (sharedBridgeState.subscribed) return;
+    sharedBridgeState.subscribed = true;
     if (webviewApi?.onMessage) {
       webviewApi.onMessage((msg) => {
         const data = msg && msg.__MSC_REQ__ ? msg.__MSC_REQ__ : msg;

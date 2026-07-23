@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "outDir": "build-tests"
   },
-  "include": ["src/utils.ts", "tests/**/*.ts"]
+  "include": ["src/utils.ts", "src/cm-bridge.ts", "tests/**/*.ts"]
 }
