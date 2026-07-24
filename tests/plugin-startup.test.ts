@@ -7,7 +7,28 @@ test('plugin onStart registers Auto Appender UI and CodeMirror bridge', async ()
   const commands: string[] = [];
   const menus: Array<{ id: string; command: string; location: string; accelerator?: string }> = [];
   const contentScripts: Array<{ type: string; id: string; script: string }> = [];
+  const contentScriptListeners: string[] = [];
   const toolbars: Array<{ id: string; command: string; location: string }> = [];
+  let onMessageLookups = 0;
+  const contentScriptApi = new Proxy(
+    {
+      async register(type: string, id: string, script: string) {
+        contentScripts.push({ type, id, script });
+      },
+      async onMessage(id: string) {
+        contentScriptListeners.push(id);
+      }
+    },
+    {
+      get(target, property, receiver) {
+        if (property === 'onMessage') {
+          onMessageLookups += 1;
+          if (onMessageLookups > 1) throw new Error('content script method was inspected before invocation');
+        }
+        return Reflect.get(target, property, receiver);
+      }
+    }
+  );
 
   (globalThis as any).joplin = {
     plugins: {
@@ -35,11 +56,7 @@ test('plugin onStart registers Auto Appender UI and CodeMirror bridge', async ()
         return undefined;
       }
     },
-    contentScripts: {
-      async register(type: string, id: string, script: string) {
-        contentScripts.push({ type, id, script });
-      }
-    },
+    contentScripts: contentScriptApi,
     commands: {
       async register(command: { name: string }) {
         commands.push(command.name);
@@ -91,6 +108,8 @@ test('plugin onStart registers Auto Appender UI and CodeMirror bridge', async ()
       script: './cm-bridge.js'
     }
   ]);
+  assert.deepEqual(contentScriptListeners, ['auto-appender-editor-bridge']);
+  assert.equal(onMessageLookups, 1);
   assert.ok(commands.includes('autoAppender.sendToDestination'));
   assert.ok(commands.includes('autoAppender.openSetup'));
   assert.ok(

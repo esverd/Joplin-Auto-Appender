@@ -63,7 +63,19 @@ function createSerialQueue() {
   };
 }
 
+// src/bridge-protocol.ts
+var BRIDGE_COMMAND = "autoAppender__takeMoveText";
+var BRIDGE_RESULT_TYPE = "autoAppender.moveResult";
+
 // src/index.ts
+var joplin = (() => {
+  try {
+    const api = require("api");
+    return api?.default ?? api;
+  } catch {
+    return globalThis.joplin;
+  }
+})();
 var ContentScriptType = { CodeMirrorPlugin: "codeMirrorPlugin" };
 var MenuItemLocation = {
   Tools: "tools",
@@ -83,43 +95,11 @@ var DEFAULT_SHORTCUT = "Ctrl+Alt+F";
 var BRIDGE_NAME = "auto-appender-editor-bridge";
 var pendingBridgeRequests = /* @__PURE__ */ new Map();
 var bridgeListenerRegistered = false;
-var bridgeWindowUnsub = null;
 var latestMoveOperationId = 0;
 var moveInProgress = false;
 var setupDialogHandle = null;
 var sourceWriteQueues = /* @__PURE__ */ new Map();
 var targetWriteQueues = /* @__PURE__ */ new Map();
-function getWindowApi() {
-  try {
-    return joplin.window ?? null;
-  } catch {
-    return null;
-  }
-}
-async function tryInvokeWindow(name, ...args) {
-  const win = getWindowApi();
-  if (!win) return { ok: false };
-  let method;
-  try {
-    method = win[name];
-  } catch (err) {
-    console.info(`[Auto Appender debug] window.${name} unavailable:`, err?.message || err);
-    return { ok: false };
-  }
-  if (typeof method !== "function") {
-    if (method !== void 0) {
-      console.info(`[Auto Appender debug] window.${name} not callable (type: ${typeof method})`);
-    }
-    return { ok: false };
-  }
-  try {
-    const result = await Reflect.apply(method, win, args);
-    return { ok: true, result };
-  } catch (err) {
-    console.info(`[Auto Appender debug] window.${name} call failed:`, err?.message || err);
-    return { ok: false };
-  }
-}
 var SETTINGS = {
   section: "msc",
   targetMode: "msc.targetMode",
@@ -300,104 +280,50 @@ async function setNotebookOverride(folderId, noteId) {
 }
 function handleBridgeMessage(raw) {
   const msg = raw && raw.__MSC_RES__ ? raw.__MSC_RES__ : raw;
-  const id = msg?.requestId;
-  if (!id) {
-    if (msg?.event === "MSC_DEBUG") {
-      const details = JSON.stringify(msg.data ?? msg, null, 2);
-      console.info("[Auto Appender debug]", details);
-    }
-    return;
-  }
+  if (msg?.type !== BRIDGE_RESULT_TYPE || typeof msg.requestId !== "string") return;
+  const id = msg.requestId;
   const pending = pendingBridgeRequests.get(id);
   if (!pending) return;
-  if (pending.closed) return;
+  pendingBridgeRequests.delete(id);
+  clearTimeout(pending.timeout);
   if (msg.ok) {
-    pending.closed = true;
-    pendingBridgeRequests.delete(id);
-    clearTimeout(pending.timeout);
     pending.resolve(msg.data);
     return;
   }
-  pending.completedResponses += 1;
-  pending.errors.push(msg.error || "Bridge error");
-  if (pending.expectedResponses > 0 && pending.completedResponses >= pending.expectedResponses) {
-    pending.closed = true;
-    pendingBridgeRequests.delete(id);
-    clearTimeout(pending.timeout);
-    pending.reject(new Error(pending.errors.join("; ")));
-  }
+  pending.reject(new Error(msg.error || "Editor bridge error"));
 }
 async function ensureBridgeListener() {
   if (bridgeListenerRegistered) return;
-  const cs = joplin.contentScripts;
-  if (typeof cs?.onMessage === "function") {
-    try {
-      await cs.onMessage(BRIDGE_NAME, (raw) => handleBridgeMessage(raw));
-    } catch (err) {
-      console.info("[Auto Appender debug] contentScripts.onMessage unavailable:", err?.message || err);
-    }
-  }
-  if (!bridgeWindowUnsub) {
-    const res = await tryInvokeWindow("onMessage", (raw) => handleBridgeMessage(raw));
-    if (res.ok && typeof res.result === "function") {
-      bridgeWindowUnsub = res.result;
-    }
-  }
+  await joplin.contentScripts.onMessage(BRIDGE_NAME, (raw) => handleBridgeMessage(raw));
   bridgeListenerRegistered = true;
 }
-async function bridgeRequest(type, payload) {
+async function takeMoveTextViaBridge(fallback) {
   await ensureBridgeListener();
   const id = Math.random().toString(36).slice(2);
-  return new Promise(async (resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      const pending2 = pendingBridgeRequests.get(id);
-      pendingBridgeRequests.delete(id);
-      if (!pending2 || pending2.closed) return;
-      pending2.closed = true;
-      const details = pending2.errors.length ? `: ${pending2.errors.join("; ")}` : "";
-      reject(new Error(`Editor bridge timeout${details}`));
-    }, 1200);
+      if (!pendingBridgeRequests.delete(id)) return;
+      reject(new Error("Editor bridge timeout. Click into the Markdown editor and try again."));
+    }, 3e3);
     const pending = {
       resolve,
       reject,
-      timeout,
-      expectedResponses: 0,
-      completedResponses: 0,
-      errors: [],
-      closed: false
+      timeout
     };
     pendingBridgeRequests.set(id, pending);
-    let sent = false;
-    const cs = joplin.contentScripts;
-    if (typeof cs?.postMessage === "function") {
-      pending.expectedResponses += 1;
-      try {
-        await cs.postMessage(BRIDGE_NAME, { type, requestId: id, payload });
-        sent = true;
-      } catch {
-        pending.expectedResponses -= 1;
-      }
-    }
-    if (!sent) {
-      pending.expectedResponses += 1;
-      const res = await tryInvokeWindow("postMessage", { __MSC_REQ__: { type, requestId: id, payload } });
-      if (res.ok) sent = true;
-      else pending.expectedResponses -= 1;
-    }
-    if (!sent) {
-      clearTimeout(timeout);
+    void Promise.resolve().then(
+      () => joplin.commands.execute("editor.execCommand", {
+        name: BRIDGE_COMMAND,
+        args: [{ requestId: id, fallback }]
+      })
+    ).catch((err) => {
+      const active = pendingBridgeRequests.get(id);
+      if (!active) return;
       pendingBridgeRequests.delete(id);
-      reject(
-        new Error(
-          "Unable to communicate with editor bridge. Please update Joplin to 2.14+ so content script messaging is available."
-        )
-      );
-    }
+      clearTimeout(active.timeout);
+      reject(new Error(`Unable to execute the editor bridge: ${err?.message || String(err)}`));
+    });
   });
-}
-async function takeMoveTextViaBridge(fallback) {
-  const data = await bridgeRequest("TAKE_MOVE_TEXT", { fallback });
-  return data;
 }
 async function getSelectedNote() {
   const note = await joplin.workspace.selectedNote();
@@ -657,6 +583,7 @@ joplin.plugins.register({
       BRIDGE_NAME,
       "./cm-bridge.js"
     );
+    await ensureBridgeListener();
     await joplin.commands.register({
       name: "autoAppender.sendToDestination",
       label: "Auto Appender: Send to destination note",

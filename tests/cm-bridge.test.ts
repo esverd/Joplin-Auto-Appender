@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-test('editor bridge processes a move request once across reloads and delayed duplicates', async () => {
-  const webviewMessageHandlers: Array<(message: any) => void> = [];
-  const windowMessageHandlers: Array<(event: { data: any }) => void> = [];
-  const webviewResponses: any[] = [];
+import createEditorBridge from '../src/cm-bridge';
+import { BRIDGE_COMMAND, BRIDGE_RESULT_TYPE } from '../src/bridge-protocol';
+
+test('editor bridge sends the same result for a delayed duplicate command', async () => {
+  const responses: any[] = [];
+  const commands = new Map<string, (request: any) => Promise<void>>();
   let docText = 'Before\nHighlighted\n- [ ] Below one\n- [ ] Below two';
   const selectedFrom = docText.indexOf('Highlighted');
   let selectionFrom = selectedFrom;
@@ -21,6 +23,12 @@ test('editor bridge processes a move request once across reloads and delayed dup
           return docText.slice(from, to);
         },
         doc: {
+          lineAt(index: number) {
+            const from = docText.lastIndexOf('\n', Math.max(0, index - 1)) + 1;
+            const nextBreak = docText.indexOf('\n', index);
+            const to = nextBreak === -1 ? docText.length : nextBreak;
+            return { from, to, text: docText.slice(from, to) };
+          },
           toString() {
             return docText;
           }
@@ -37,67 +45,46 @@ test('editor bridge processes a move request once across reloads and delayed dup
     }
   };
 
-  (globalThis as any).window = {
-    cm6: { view },
-    webviewApi: {
-      onMessage(handler: (message: any) => void) {
-        webviewMessageHandlers.push(handler);
-      },
-      postMessage(message: any) {
-        webviewResponses.push(message);
-      }
-    },
-    addEventListener(type: string, handler: (event: { data: any }) => void) {
-      if (type === 'message') windowMessageHandlers.push(handler);
-    },
-    postMessage() {
-      // The test invokes the subscribed handler directly when needed.
-    },
-    location: { href: 'http://localhost/editor' }
-  };
+  const bridge = createEditorBridge({
+    async postMessage(message) {
+      responses.push(message);
+    }
+  });
+  bridge.plugin({
+    cm6: view,
+    editor: view,
+    registerCommand(name, handler) {
+      commands.set(name, handler);
+    }
+  });
 
-  const bridgeModulePath = require.resolve('../src/cm-bridge');
-  require(bridgeModulePath);
-  delete require.cache[bridgeModulePath];
-  require(bridgeModulePath);
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  webviewResponses.length = 0;
+  const command = commands.get(BRIDGE_COMMAND);
+  assert.ok(command);
+  const request = { requestId: 'same-request', fallback: 'taskBlock' as const };
 
-  assert.equal(webviewMessageHandlers.length, 1);
-  assert.equal(windowMessageHandlers.length, 1);
-  const request = {
-    type: 'TAKE_MOVE_TEXT',
-    requestId: 'same-request',
-    payload: { fallback: 'taskBlock' }
-  };
-
-  webviewMessageHandlers[0](request);
+  await command!(request);
   const afterFirstCut = docText;
-  const firstResponse = webviewResponses[webviewResponses.length - 1]?.__MSC_RES__;
-
+  const firstResponse = responses[0];
+  assert.equal(firstResponse.type, BRIDGE_RESULT_TYPE);
   assert.equal(firstResponse.ok, true);
   assert.equal(firstResponse.data.text, 'Highlighted');
 
-  webviewMessageHandlers[0](request);
-  const secondResponse = webviewResponses[webviewResponses.length - 1]?.__MSC_RES__;
+  // The previous bridge's short cache expired after five seconds. This command
+  // must remain one-shot even after the old failure window has elapsed.
+  await new Promise((resolve) => setTimeout(resolve, 5_100));
+  await command!(request);
 
   assert.equal(docText, afterFirstCut);
-  assert.deepEqual(secondResponse, firstResponse);
+  assert.deepEqual(responses[1], firstResponse);
+  assert.equal(docText, 'Before\n\n- [ ] Below one\n- [ ] Below two');
 
-  const originalDateNow = Date.now;
-  try {
-    Date.now = () => originalDateNow() + 5_001;
-    webviewMessageHandlers[0](request);
-  } finally {
-    Date.now = originalDateNow;
+  for (let index = 0; index <= 128; index += 1) {
+    await command!({ requestId: 'filler-' + index, fallback: 'none' });
   }
+  await command!(request);
 
-  const delayedResponse = webviewResponses[webviewResponses.length - 1]?.__MSC_RES__;
   assert.equal(docText, afterFirstCut);
-  assert.equal(delayedResponse.ok, false);
-  assert.equal(delayedResponse.error, 'Duplicate move request ignored');
-
-  const responseCount = webviewResponses.length;
-  windowMessageHandlers[0]({ data: { __MSC_RES__: firstResponse } });
-  assert.equal(webviewResponses.length, responseCount);
+  const finalResponse = responses[responses.length - 1];
+  assert.equal(finalResponse?.ok, false);
+  assert.equal(finalResponse?.error, 'Duplicate move request ignored');
 });

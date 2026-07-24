@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { BRIDGE_COMMAND, BRIDGE_RESULT_TYPE } from '../src/bridge-protocol';
+
 async function waitFor(condition: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     if (condition()) return;
@@ -65,15 +67,13 @@ test('send command ignores repeat invocations while a selection move is pending'
       async onMessage(_name: string, listener: (message: any) => void) {
         bridgeListener = listener;
       },
-      async postMessage(_name: string, message: any) {
-        if (message.type === 'TAKE_MOVE_TEXT') takeRequests.push(message);
-      }
     },
     commands: {
       async register(command: { name: string; execute?: () => Promise<void> }) {
         commands.set(command.name, command);
       },
-      async execute() {
+      async execute(commandName: string, args?: { name?: string; args?: any[] }) {
+        if (commandName === 'editor.execCommand') takeRequests.push(args);
         return undefined;
       }
     },
@@ -124,6 +124,7 @@ test('send command ignores repeat invocations while a selection move is pending'
 
   const firstSend = send!.execute!();
   await waitFor(() => takeRequests.length === 1);
+  assert.equal(takeRequests[0].name, BRIDGE_COMMAND);
 
   const repeatedSends = [send!.execute!(), send!.execute!()];
   await Promise.resolve();
@@ -131,17 +132,16 @@ test('send command ignores repeat invocations while a selection move is pending'
 
   assert.ok(bridgeListener);
   bridgeListener!({
-    __MSC_RES__: {
-      requestId: takeRequests[0].requestId,
-      ok: true,
-      data: {
-        impl: 'cm6',
-        text: 'Highlighted',
-        ranges: [{ from: 0, to: 11 }],
-        cursorIndex: 0,
-        updatedDocText: '- [ ] Below',
-        takenKind: 'selection'
-      }
+    type: BRIDGE_RESULT_TYPE,
+    requestId: takeRequests[0].args[0].requestId,
+    ok: true,
+    data: {
+      impl: 'cm6',
+      text: 'Highlighted',
+      ranges: [{ from: 0, to: 11 }],
+      cursorIndex: 0,
+      updatedDocText: '- [ ] Below',
+      takenKind: 'selection'
     }
   });
 
